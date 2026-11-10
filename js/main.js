@@ -6,6 +6,7 @@ import { World } from './world.js';
 import { Vehicle, SPEC } from './vehicle.js';
 import { Instruments } from './instruments.js';
 import { Input } from './input.js';
+import { CarAudio } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -74,6 +75,8 @@ loader.setMeshoptDecoder(MeshoptDecoder);
 
 let vehicle, carRoot, instruments, steering, wheelNodes = {};
 const input = new Input();
+const audio = new CarAudio();
+try { audio.on = localStorage.getItem('morinodrive.sound') !== 'off'; } catch {}
 let camMode = 'chase';
 let paused = false;
 let started = false;
@@ -160,6 +163,7 @@ Promise.all([carReady, mapReady]).then(([gltf]) => {
 
 ui.start.addEventListener('click', () => {
   started = true;
+  audio.start();
   ui.loader.classList.add('gone');
   setTimeout(() => (ui.loader.hidden = true), 700);
   currentPlace = null;
@@ -184,6 +188,9 @@ input.on('reset', () => {
   vehicle.reset(sp.x, sp.z, sp.heading);
   chase.init = false;
 });
+function updateSoundLabel() { const b = ui.pause.querySelector('[data-act="sound"] span'); if (b) b.textContent = audio.on ? '入' : '切'; }
+updateSoundLabel();
+
 // ---------- 画質:標準 / 軽量 ----------
 let quality = 'normal';
 try { quality = localStorage.getItem('morinodrive.quality') || 'normal'; } catch {}
@@ -249,6 +256,7 @@ input.on('help', () => { if (started) { ui.help.hidden = !ui.help.hidden; helpTi
 input.on('pause', () => { if (started) setPaused(!paused); });
 function setPaused(p) {
   paused = p;
+  audio.pause(p);
   ui.pause.hidden = !p;
   if (p) ui.pause.querySelector('button').focus();
 }
@@ -260,6 +268,7 @@ ui.pause.addEventListener('click', (e) => {
   if (a === 'reset') { input._emit('reset'); setPaused(false); }
   if (a === 'help') { ui.help.hidden = false; helpTimer = 999; setPaused(false); }
   if (a === 'map') { setMinimap(!mapOn); setPaused(false); }
+  if (a === 'sound') { audio.setOn(!audio.on); try { localStorage.setItem('morinodrive.sound', audio.on ? 'on' : 'off'); } catch {} updateSoundLabel(); }
   if (a === 'quality') { quality = quality === 'low' ? 'normal' : 'low'; try { localStorage.setItem('morinodrive.quality', quality); } catch {} applyQuality(); }
 });
 
@@ -345,6 +354,7 @@ function frame() {
     instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '', camMode === 'cockpit');
     world.pumpNavTiles(vehicle.pos.x, vehicle.pos.z);
     drawMinimap(dt);
+    if (started && !paused) audio.update(dt, vehicle, { cockpit: camMode === 'cockpit' });
     updateCamera(dt);
     const fc = window.__drive?.freeCam; // 確認用の上空カメラ
     if (fc) { camera.position.set(...fc.pos); camera.lookAt(...fc.look); camera.updateProjectionMatrix(); }
@@ -376,4 +386,4 @@ addEventListener('resize', () => {
 });
 
 // 動作確認用(自動テストから車を動かす)
-window.__drive = { get scene() { return scene; }, get caps() { return { reverse: renderer.capabilities.reverseDepthBuffer, ratio: pixelRatio }; }, get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };
+window.__drive = { get audio() { return audio; }, get scene() { return scene; }, get caps() { return { reverse: renderer.capabilities.reverseDepthBuffer, ratio: pixelRatio }; }, get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };

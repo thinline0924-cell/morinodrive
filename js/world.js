@@ -73,12 +73,14 @@ export class World {
     this.curbs = d.roads.curbs || [];
     this.medians = d.roads.medians || [];
     this.streetTrees = d.roads.streetTrees || [];
+    this.walls = d.roads.walls || [];
     // ぶつかる物(電柱・信号の柱・街路樹・分離帯の植え込み)
     this.solids = new Map();
     for (let i = 0; i < this.poles.length; i += 3) this._addSolid({ x: this.poles[i], z: this.poles[i + 1], r: 0.22 });
     for (const sg of this.signals) this._addSolid({ x: sg[0], z: sg[1], r: 0.18 });
     for (const g of this.guards) for (let i = 0; i + 3 < g.length; i += 2) this._addSolid({ x: g[i], z: g[i + 1], bx: g[i + 2], bz: g[i + 3], r: 0.15 });
     for (const ss of this.speedSigns) this._addSolid({ x: ss[0], z: ss[1], r: 0.1 });
+    for (const w of this.walls) for (let i = 0; i + 3 < w.p.length; i += 2) this._addSolid({ x: w.p[i], z: w.p[i + 1], bx: w.p[i + 2], bz: w.p[i + 3], r: w.t === 1 ? 0.35 : 0.12 });
     for (let i = 0; i < this.streetTrees.length; i += 2) this._addSolid({ x: this.streetTrees[i], z: this.streetTrees[i + 1], r: 0.3 });
     for (const m of this.medians) for (let i = 0; i + 3 < m.p.length; i += 2) {
       const w = Math.min(m.w[i / 2], m.w[i / 2 + 1]);
@@ -265,6 +267,7 @@ export class World {
     this._buildTrees(scene);
     this._buildCrossings(scene);
     this._buildCurbs(scene);
+    this._buildWalls(scene);
     this._buildWires(scene);
     this._buildGuards(scene);
     this._buildSpeedSigns(scene);
@@ -552,7 +555,8 @@ uniform int usePhoto;`)
         quad(G, [ax, fl, az], [ax, eave, az], [bx, eave, bz], [bx, fl, bz], nn, wallCol, [[u0, v0], [u0, v1], [u1, v1], [u1, v0]], wallLow);
         if (fl - g0 > 0.05) quad(ch.roof, [ax, g0, az], [ax, fl, az], [bx, fl, bz], [bx, g0, bz], nn, baseCol, [[0, 0], [0, 0], [0, 0], [0, 0]]);
       }
-      const roofCol = tmp.set(pick(st[6])).clone().multiplyScalar(0.9 + rnd() * 0.2);
+      // 屋根の色:空中写真から取った色があれば使う(霞の分だけ暗く・色を濃く)
+      const roofCol = b.rc != null ? photoRoof(b.rc, tmp) : tmp.set(pick(st[6])).clone().multiplyScalar(0.9 + rnd() * 0.2);
       if (useGable) {
         const [cx, cz, ang, L, W] = b.r;
         const ux = Math.cos(ang), uz = Math.sin(ang), vx = -uz, vz = ux;
@@ -572,7 +576,7 @@ uniform int usePhoto;`)
           fac = fac0;
         }
       } else {
-        const flat = tmp.set(0x8f8e8a).clone().multiplyScalar(0.85 + rnd() * 0.25);
+        const flat = b.rc != null ? photoRoof(b.rc, tmp) : tmp.set(0x8f8e8a).clone().multiplyScalar(0.85 + rnd() * 0.25);
         const contour = []; for (let i = 0; i < n; i++) contour.push(new THREE.Vector2(p[i * 2], p[i * 2 + 1]));
         for (const t of THREE.ShapeUtils.triangulateShape(contour, [])) triangle(ch.roof, [p[t[0] * 2], top, p[t[0] * 2 + 1]], [p[t[2] * 2], top, p[t[2] * 2 + 1]], [p[t[1] * 2], top, p[t[1] * 2 + 1]], [0, 1, 0], flat, [[0, 0], [0, 0], [0, 0]]);
         // 屋上の立ち上がり(パラペット)
@@ -712,7 +716,7 @@ uniform int usePhoto;`)
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(P.length).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
-    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, color: 0x35505a, roughness: 0.08, metalness: 0.2, envMapIntensity: 1.2, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, color: 0x2a3a30, roughness: 0.22, metalness: 0.0, envMapIntensity: 0.6, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
     m.receiveShadow = true;
     scene.add(m);
   }
@@ -826,6 +830,7 @@ uniform int usePhoto;`)
   // 遠くの木の塊は描かない(霧で見えない距離)
   // 塊の中心からの距離で、近い形・遠い形・描かないを切り替える(画質の設定で距離が変わる)
   updateVisibility(cam) {
+    for (const l of this.wireChunks || []) { const sp = l.geometry.boundingSphere; l.visible = sp.center.distanceTo(cam) - sp.radius < 180; }
     for (const c of this.terrainChunks || []) {
       const sp = c.hi.geometry.boundingSphere;
       const far = sp.center.distanceTo(cam) - sp.radius > 450;
@@ -901,9 +906,22 @@ uniform int usePhoto;`)
         }
       }
     }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
-    scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x26292c })));
+    // 線は遠くでも 1 画素の太さで描かれて黒く目立つので、256m の塊に分けて近い塊だけ描く
+    const mat = new THREE.LineBasicMaterial({ color: 0x3a3e42, transparent: true, opacity: 0.85 });
+    const groups = new Map();
+    for (let i = 0; i < P.length; i += 6) {
+      const k = `${Math.floor(P[i] / 256)},${Math.floor(P[i + 2] / 256)}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(...P.slice(i, i + 6));
+    }
+    this.wireChunks = [];
+    for (const arr of groups.values()) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+      g.computeBoundingSphere();
+      const l = new THREE.LineSegments(g, mat);
+      scene.add(l); this.wireChunks.push(l);
+    }
   }
 
   // ---------- ガードレール(白い波形の板と支柱) ----------
@@ -977,6 +995,68 @@ uniform int usePhoto;`)
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
     scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ map: tex, roughness: 0.5, side: THREE.DoubleSide, emissive: 0xffffff, emissiveMap: tex, emissiveIntensity: 0.15 })), poles);
+  }
+
+  // ---------- 敷地の境:ブロック塀(笠木つき)・生垣・アルミフェンス ----------
+  _buildWalls(scene) {
+    const P = [], N = [], C = [];
+    const FP = [], FU = [];
+    const rnd = mulberry32(5);
+    const col = new THREE.Color();
+    const push = (v, n, c) => { P.push(...v); N.push(...n); C.push(c.r, c.g, c.b); };
+    const box = (ax, az, bx, bz, y0a, y0b, h, th, c, capC) => {
+      const L = Math.hypot(bx - ax, bz - az); if (L < 0.05) return;
+      const nx = -(bz - az) / L * th / 2, nz = (bx - ax) / L * th / 2;
+      const A1 = [ax + nx, y0a, az + nz], A2 = [ax - nx, y0a, az - nz], B1 = [bx + nx, y0b, bz + nz], B2 = [bx - nx, y0b, bz - nz];
+      const T = (q) => [q[0], q[1] + h, q[2]];
+      const n1 = [nx / (th / 2), 0, nz / (th / 2)], n2 = n1.map((v) => -v);
+      for (const v of [A1, B1, T(B1), A1, T(B1), T(A1)]) push(v, n1, c);
+      for (const v of [A2, T(B2), B2, A2, T(A2), T(B2)]) push(v, n2, c);
+      for (const v of [T(A1), T(B1), T(B2), T(A1), T(B2), T(A2)]) push(v, [0, 1, 0], capC || c);
+    };
+    for (const w of this.walls) {
+      const pts = w.p;
+      if (w.t === 0) col.setHSL(0.1, 0.04, 0.5 + rnd() * 0.12);
+      else if (w.t === 1) col.setHSL(0.27 + rnd() * 0.04, 0.42, 0.1 + rnd() * 0.03);
+      const cap = col.clone().multiplyScalar(0.85);
+      for (let i = 0; i + 3 < pts.length; i += 2) {
+        const ax = pts[i], az = pts[i + 1], bx = pts[i + 2], bz = pts[i + 3];
+        const ha = this.terrainHeight(ax, az) - 0.05, hb = this.terrainHeight(bx, bz) - 0.05;
+        if (w.t === 0) {
+          box(ax, az, bx, bz, ha, hb, w.h, 0.15, col);
+          // 笠木(上の縁の少し広い板)
+          box(ax, az, bx, bz, ha + w.h, hb + w.h, 0.06, 0.19, cap);
+        } else if (w.t === 1) {
+          box(ax, az, bx, bz, ha, hb, w.h, 0.6, col);
+        } else {
+          // フェンス:低い土台+縦格子の板(透かし)
+          box(ax, az, bx, bz, ha, hb, 0.25, 0.15, col.setHSL(0.1, 0.04, 0.55));
+          const L = Math.hypot(bx - ax, bz - az);
+          for (const v of [[ax, ha + 0.25, az], [bx, hb + 0.25, bz], [bx, hb + 0.25 + w.h - 0.25, bz], [ax, ha + 0.25, az], [bx, hb + w.h, bz], [ax, ha + w.h, az]]) FP.push(...v);
+          FU.push(0, 0, L, 0, L, 1, 0, 0, L, 1, 0, 1);
+        }
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, side: THREE.DoubleSide }));
+    m.castShadow = m.receiveShadow = true;
+    scene.add(m);
+    if (FP.length) {
+      const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+      const gg = c.getContext('2d');
+      gg.fillStyle = '#3d342c'; for (let x = 2; x < 64; x += 11) gg.fillRect(x, 0, 4, 64); gg.fillRect(0, 0, 64, 5); gg.fillRect(0, 59, 64, 5);
+      const tex = new THREE.CanvasTexture(c); tex.wrapS = THREE.RepeatWrapping; tex.colorSpace = THREE.SRGBColorSpace;
+      const fg = new THREE.BufferGeometry();
+      fg.setAttribute('position', new THREE.Float32BufferAttribute(FP, 3));
+      fg.setAttribute('uv', new THREE.Float32BufferAttribute(FU, 2));
+      fg.computeVertexNormals();
+      const fm = new THREE.Mesh(fg, new THREE.MeshStandardMaterial({ map: tex, alphaTest: 0.5, transparent: false, side: THREE.DoubleSide, roughness: 0.5, metalness: 0.3 }));
+      fm.castShadow = true;
+      scene.add(fm);
+    }
   }
 
   // ---------- 縁石(高さ 15cm、幅 18cm) ----------
@@ -1186,6 +1266,15 @@ uniform int usePhoto;`)
     }
     g.restore();
   }
+}
+
+// 空中写真の屋根の色を、地上から見た色に近づける
+function photoRoof(rc, tmp) {
+  // 空中写真の霞(だいたい R+14 G+16 B+30 の明るい青み)を差し引き、彩度を少し戻す
+  let r = ((rc >> 16) & 255) - 14, g = ((rc >> 8) & 255) - 16, b = (rc & 255) - 30;
+  const l = (r + g + b) / 3;
+  const f = (v) => Math.max(10, Math.min(240, (l + (v - l) * 1.35) * 1.02));
+  return tmp.setRGB(f(r) / 255, f(g) / 255, f(b) / 255, THREE.SRGBColorSpace).clone();
 }
 
 // ---------- 素材の絵 ----------

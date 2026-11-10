@@ -6,6 +6,9 @@ import sharp from 'sharp';
 import earcut from 'earcut';
 import { AREA, ORIGIN, toLocal } from './area.mjs';
 import { parseOSM } from './osm.mjs';
+import * as photo from './photo18.mjs';
+const nPhoto = await photo.loadAll();
+console.log('aerial photo tiles (z18)', nPhoto);
 
 const RAW = path.join(import.meta.dirname, 'raw');
 const OUT = path.join(import.meta.dirname, '../../assets/map');
@@ -222,6 +225,24 @@ for (const b of plateau.buildings) {
     }
   }
   const o = { p: p.flat().map(r1), h: r1(h), g: r2(gmax), gb: r2(gmin), u: b.u || 461 };
+  // 屋根の色:空中写真で建物の内側(縁から 0.8m 以上内側)を 0.8m おきに読み、中央値をとる
+  {
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const q of p) { x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); z0 = Math.min(z0, q[1]); z1 = Math.max(z1, q[1]); }
+    const rs = [], gs = [], bs = [];
+    const edgeD = (x, z) => { let best = Infinity; for (let i = 0; i < p.length; i++) { const a = p[i], c = p[(i + 1) % p.length]; const dx = c[0] - a[0], dz = c[1] - a[1], L2 = dx * dx + dz * dz || 1; const t = Math.min(1, Math.max(0, ((x - a[0]) * dx + (z - a[1]) * dz) / L2)); best = Math.min(best, Math.hypot(x - a[0] - dx * t, z - a[1] - dz * t)); } return best; };
+    for (let x = x0 + 0.4; x < x1; x += 0.8) for (let z = z0 + 0.4; z < z1; z += 0.8) {
+      let inside = false;
+      for (let i = 0, j = p.length - 1; i < p.length; j = i++) if ((p[i][1] > z) !== (p[j][1] > z) && x < (p[j][0] - p[i][0]) * (z - p[i][1]) / (p[j][1] - p[i][1]) + p[i][0]) inside = !inside;
+      if (!inside || edgeD(x, z) < 0.8) continue;
+      const c = photo.colorAt(x, z); if (!c) continue;
+      rs.push(c[0]); gs.push(c[1]); bs.push(c[2]);
+    }
+    if (rs.length >= 3) {
+      const med = (a) => { a.sort((u, v) => u - v); return a[a.length >> 1]; };
+      o.rc = (med(rs) << 16) | (med(gs) << 8) | med(bs);
+    }
+  }
   if (b.st) o.s = b.st;
   if (b.n) o.n = b.n;
   // ---- 種類 ----
@@ -451,16 +472,30 @@ for (let z = m.z0 + 20; z < zEnd; z += 9) for (let x = m.x0 + 20; x < xEnd; x +=
   trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), type);
 }
 const nForest = trees.length / 4;
-// 住宅地の庭:建物のまわりの敷地(道路と建物の外)に庭木と低木
-for (let z = m.z0 + 20; z < zEnd; z += 5) for (let x = m.x0 + 20; x < xEnd; x += 5) {
-  const px = x + (rnd() - 0.5) * 4, pz = z + (rnd() - 0.5) * 4;
-  const lu = luAt(px, pz);
-  if (lu !== 6 && lu !== 7 && lu !== 5) continue;
-  const bv = chanB(px, pz);
-  if (bv < 30 || bv > 200) continue;
-  if (rnd() > (lu === 6 ? 0.5 : 0.15) || !clearOf(px, pz, 1.2)) continue;
-  trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), rnd() < 0.35 ? 2 : 3);
+// 住宅地・公園などの植物:空中写真で緑に写っている所に置く(2m 四方の色の平均と、明るさのばらつきで木か低木か芝かを分ける)
+const photoStats = (x, z, half = 1.0) => {
+  let n = 0, r = 0, g = 0, b = 0, l2 = 0;
+  for (let dx = -half; dx <= half + 1e-6; dx += 0.4) for (let dz = -half; dz <= half + 1e-6; dz += 0.4) {
+    const c = photo.colorAt(x + dx, z + dz); if (!c) continue;
+    r += c[0]; g += c[1]; b += c[2]; const l = (c[0] + c[1] + c[2]) / 3; l2 += l * l; n++;
+  }
+  if (!n) return null;
+  r /= n; g /= n; b /= n; const l = (r + g + b) / 3;
+  return { r, g, b, l, v: l2 / n - l * l, exg: (2 * g - r - b) / (r + g + b + 1) };
+};
+let nVegTree = 0, nVegShrub = 0;
+for (let z = m.z0 + 20; z < zEnd; z += 2.5) for (let x = m.x0 + 20; x < xEnd; x += 2.5) {
+  const lu = luAt(x, z);
+  if (lu !== 5 && lu !== 6 && lu !== 7 && lu !== 8) continue;
+  const px = x + (rnd() - 0.5) * 1.2, pz = z + (rnd() - 0.5) * 1.2;
+  if (maskAt(px, pz) !== 0 || !clearOf(px, pz, 1.0)) continue;
+  const st = photoStats(px, pz);
+  // この空中写真は霞んで青みがあるので、林の中央値(0.033)を目安に 0.02 以上を植物とみなす
+  if (!st || st.exg < 0.02 || st.l > 140) continue;
+  if (st.v > 110 && st.l < 120) { trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), 2); nVegTree++; }
+  else if (st.exg > 0.028 && rnd() < 0.5) { trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), 3); nVegShrub++; }
 }
+console.log('vegetation from aerial photo: trees', nVegTree, 'shrubs', nVegShrub);
 console.log('trees', nForest, 'garden plants', trees.length / 4 - nForest);
 
 // ---------- 区画線・電柱:中心線から左右に道路の面の端を探して幅を測る ----------
@@ -765,7 +800,165 @@ const streetTrees = [];
   console.log('street trees', streetTrees.length / 2);
 }
 
-fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water, curbs, medians, streetTrees }));
+// ---------- 駐車場:OSM の駐車場と、店などの建物の前で空中写真に舗装(灰色)が写る所。2.5m × 5m の区画に白線 ----------
+const parkLines = [];
+let parkCells = 0;
+{
+  const RGBb = globalThis.__rgb;
+  const setAsphalt = (x, z) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); if (i < 0 || j < 0 || i >= MASK.w || j >= MASK.h) return; if (mask[j * MASK.w + i] !== 0) return; RGBb[(j * MASK.w + i) * 3] = 255; RGBb[(j * MASK.w + i) * 3 + 1] = 0; };
+  const gray = (x, z) => { const c = photo.colorAt(x, z); if (!c) return false; const mx = Math.max(...c), mn = Math.min(...c), l = (c[0] + c[1] + c[2]) / 3; return mx - mn < 28 && l > 85 && l < 190 && (2 * c[1] - c[0] - c[2]) / (c[0] + c[1] + c[2] + 1) < -0.005; };
+  const lineKey = new Set();
+  const addLine = (ax, az, bx, bz) => { const k = [ax, az, bx, bz].map((v) => Math.round(v * 2)).join(','); if (lineKey.has(k)) return; lineKey.add(k); parkLines.push({ s: 'edge', p: [r1(ax), r1(az), r1(bx), r1(bz)] }); };
+  const usedCell = new Set();
+  // 区画を並べる:u 方向に 2.5m、v 方向は「区画 5m・区画 5m・通路 6m」のくり返し
+  function layout(cx, cz, ang, R, inRegion) {
+    const ux = Math.cos(ang), uz = Math.sin(ang), vx = -uz, vz = ux;
+    const P = (u, v) => [cx + ux * u + vx * v, cz + uz * u + vz * v];
+    for (let v0 = -R; v0 < R; v0 += 16) for (let row = 0; row < 3; row++) {
+      const va = v0 + [0, 5, 10][row], vb = va + [5, 5, 6][row];
+      for (let u = -R; u < R; u += 2.5) {
+        // 区画の中の 6 点がすべて駐車場らしい所なら使う
+        let ok = true;
+        for (const [fu, fv] of [[0.3, 0.2], [0.7, 0.2], [0.3, 0.5], [0.7, 0.5], [0.3, 0.8], [0.7, 0.8]]) { const [x, z] = P(u + 2.5 * fu, va + (vb - va) * fv); if (maskAt(x, z) !== 0 || !inRegion(x, z)) { ok = false; break; } }
+        if (!ok) continue;
+        const [mx, mz] = P(u + 1.25, (va + vb) / 2);
+        const key = `${Math.round(mx)},${Math.round(mz)}`;
+        if (usedCell.has(key)) continue; usedCell.add(key);
+        for (let a = 0; a <= 2.5; a += 0.5) for (let b = va; b <= vb; b += 0.5) setAsphalt(...P(u + a, b));
+        if (row < 2) {
+          parkCells++;
+          const [x0, z0] = P(u, va), [x1, z1] = P(u, vb), [x2, z2] = P(u + 2.5, va), [x3, z3] = P(u + 2.5, vb);
+          // 通路側を開けて、奥と両脇に線
+          addLine(x0, z0, x1, z1); addLine(x2, z2, x3, z3);
+          if (row === 0) addLine(...P(u, vb), ...P(u + 2.5, vb));
+        }
+      }
+    }
+  }
+  // OSM の駐車場
+  const nodes = new Map();
+  const osmJson = JSON.parse(fs.readFileSync(path.join(RAW, 'osm.json')));
+  for (const e of osmJson.elements) if (e.type === 'node') nodes.set(e.id, e);
+  let nOsm = 0;
+  for (const e of osmJson.elements) {
+    if (e.type !== 'way' || e.tags?.amenity !== 'parking' || e.tags?.parking === 'multi-storey' || e.tags?.parking === 'underground') continue;
+    const pts = e.nodes.map((id) => nodes.get(id)).filter(Boolean).map((n) => toLocal(n.lat, n.lon));
+    if (pts.length < 4) continue;
+    let le = 0, ang = 0, cx = 0, cz = 0;
+    for (let i = 0; i < pts.length - 1; i++) { const L = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]); if (L > le) { le = L; ang = Math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0]); } cx += pts[i][0]; cz += pts[i][1]; }
+    cx /= pts.length - 1; cz /= pts.length - 1;
+    const R = Math.min(150, Math.max(...pts.map((q) => Math.hypot(q[0] - cx, q[1] - cz))) + 5);
+    layout(cx, cz, ang, R, (x, z) => pip(pts, x, z));
+    nOsm++;
+  }
+  // 店・施設の前の舗装
+  let nShop = 0;
+  for (const b of buildings) {
+    if (![5, 6, 7, 8, 9].includes(b.c)) continue;
+    const pp = []; for (let i = 0; i < b.p.length; i += 2) pp.push([b.p[i], b.p[i + 1]]);
+    if (Math.abs(area2(pp)) < 120) continue;
+    const r = minRect(pp);
+    const R = Math.min(70, r.L / 2 + 40);
+    layout(r.cx, r.cz, r.ang, R, (x, z) => { const lu = luAt(x, z); return (lu === 7 || lu === 8) && Math.hypot(x - r.cx, z - r.cz) < R && gray(x, z); });
+    nShop++;
+  }
+  console.log('parking: osm lots', nOsm, 'shop fronts', nShop, 'stalls', parkCells, 'lines', parkLines.length);
+}
+markings.push(...parkLines);
+
+// ---------- 敷地の境:住宅地で道路に面した所に、ブロック塀・生垣・フェンス(門や駐車スペースの切れ目つき) ----------
+const walls = [];
+{
+  const W = MASK.w, Hh = MASK.h, RGBb = globalThis.__rgb;
+  const A = (i, j) => { const k = (j * W + i) * 3; const r = RGBb[k], g = RGBb[k + 1]; return r > 127 || (g > 90 && g < 170) ? 255 : 0; };
+  const list = [];
+  for (let j = 0; j < Hh - 1; j++) for (let i = 0; i < W - 1; i++) {
+    const a = A(i, j), b = A(i + 1, j), c = A(i + 1, j + 1), d = A(i, j + 1);
+    const idx = (a ? 1 : 0) | (b ? 2 : 0) | (c ? 4 : 0) | (d ? 8 : 0);
+    if (idx === 0 || idx === 15) continue;
+    const pts = [];
+    const e = (p1, q, x0, z0, x1, z1) => { if (!!p1 !== !!q) pts.push([MASK.x0 + 0.5 + (x0 + x1) / 2, MASK.z0 + 0.5 + (z0 + z1) / 2]); };
+    e(a, b, i, j, i + 1, j); e(b, c, i + 1, j, i + 1, j + 1); e(c, d, i + 1, j + 1, i, j + 1); e(d, a, i, j + 1, i, j);
+    for (let k = 0; k + 1 < pts.length; k += 2) list.push([pts[k], pts[k + 1]]);
+  }
+  const roadAt = (x, z) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); return i >= 0 && j >= 0 && i < W && j < Hh && A(i, j) > 0; };
+  const keep = list.filter(([p1, q]) => {
+    const mx = (p1[0] + q[0]) / 2, mz = (p1[1] + q[1]) / 2, dx = q[0] - p1[0], dz = q[1] - p1[1], L = Math.hypot(dx, dz) || 1;
+    let nx = -dz / L, nz = dx / L;
+    if (roadAt(mx + nx * 1.2, mz + nz * 1.2)) { nx = -nx; nz = -nz; }
+    const ox = mx + nx * 1.2, oz = mz + nz * 1.2;
+    if (luAt(ox, oz) !== 6 || maskAt(ox, oz) !== 0) return false;
+    const bv = chan(ox, oz, 2);
+    return bv > 15 && bv < 240;
+  });
+  const key = (x, z) => `${Math.round(x * 4)},${Math.round(z * 4)}`;
+  const adj = new Map();
+  keep.forEach((sg, i) => { for (const q of sg) { const k = key(...q); if (!adj.has(k)) adj.set(k, []); adj.get(k).push(i); } });
+  const used = new Uint8Array(keep.length);
+  const dp = (pts) => { if (pts.length < 3) return pts; const [a, b] = [pts[0], pts.at(-1)]; let mi = 0, md = 0; const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1e-9; for (let k = 1; k < pts.length - 1; k++) { const d = Math.abs((b[0] - a[0]) * (a[1] - pts[k][1]) - (a[0] - pts[k][0]) * (b[1] - a[1])) / L; if (d > md) { md = d; mi = k; } } return md > 0.35 ? dp(pts.slice(0, mi + 1)).slice(0, -1).concat(dp(pts.slice(mi))) : [a, b]; };
+  let total = 0;
+  for (let i = 0; i < keep.length; i++) {
+    if (used[i]) continue;
+    used[i] = 1;
+    const line = [keep[i][0], keep[i][1]];
+    for (const dir of [1, 0]) for (;;) {
+      const end = dir ? line.at(-1) : line[0];
+      const nb = (adj.get(key(...end)) || []).find((k) => !used[k]);
+      if (nb === undefined) break;
+      used[nb] = 1;
+      const [p1, q] = keep[nb];
+      const nxt = key(...p1) === key(...end) ? q : p1;
+      if (dir) line.push(nxt); else line.unshift(nxt);
+    }
+    const simp = dp(line);
+    // 道路側から 0.15m 敷地へ寄せる
+    const off = simp.map((q, k) => {
+      const a = simp[Math.max(0, k - 1)], b = simp[Math.min(simp.length - 1, k + 1)];
+      const dx = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dx, dz) || 1;
+      let nx = -dz / L, nz = dx / L; if (roadAt(q[0] + nx * 1.2, q[1] + nz * 1.2)) { nx = -nx; nz = -nz; }
+      return [q[0] + nx * 0.15, q[1] + nz * 0.15, nx, nz];
+    });
+    // 長さに沿って 7〜13m ごとの「区画」に分け、それぞれの種類と切れ目を決める
+    const seg = [];
+    for (let k = 0; k < off.length - 1; k++) {
+      const a = off[k], b = off[k + 1], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      for (let t = 0; t < L; t += 0.5) seg.push([a[0] + (b[0] - a[0]) * t / L, a[1] + (b[1] - a[1]) * t / L, a[2], a[3]]);
+    }
+    if (seg.length < 6) continue;
+    let k = 0;
+    while (k < seg.length - 2) {
+      const lotLen = Math.round((7 + rnd() * 6) / 0.5);
+      const part = seg.slice(k, k + lotLen + 1);
+      k += lotLen;
+      if (part.length < 4) break;
+      // 植物が写っていれば生垣
+      let green = 0;
+      for (const q of part) { const c = photo.colorAt(q[0] + q[2] * 0.8, q[1] + q[3] * 0.8); if (c && (2 * c[1] - c[0] - c[2]) / (c[0] + c[1] + c[2] + 1) > 0.02) green++; }
+      const rr = rnd();
+      const type = green / part.length > 0.35 ? 1 : rr < 0.55 ? 0 : rr < 0.8 ? 2 : -1;
+      if (type < 0) continue;
+      // 門・駐車スペースの切れ目(3〜5m)
+      let pieces = [part];
+      if (part.length > 12 && rnd() < 0.6) {
+        const gl = Math.round((3 + rnd() * 2) / 0.5), gs = Math.floor(rnd() * (part.length - gl));
+        pieces = [part.slice(0, gs + 1), part.slice(gs + gl)];
+      }
+      const h = type === 0 ? 1.0 + Math.floor(rnd() * 4) * 0.2 : type === 1 ? 1.0 + rnd() * 0.6 : 1.0 + rnd() * 0.2;
+      for (const pc of pieces) {
+        if (pc.length < 3) continue;
+        // 直線ならまとめる
+        const pts = dp(pc.map((q) => [q[0], q[1]]));
+        walls.push({ t: type, h: r1(h), p: pts.flat().map(r1) });
+        total += (pc.length - 1) * 0.5;
+      }
+    }
+  }
+  console.log('lot boundaries', walls.length, (total / 1000).toFixed(1), 'km', JSON.stringify([0, 1, 2].map((t) => walls.filter((w) => w.t === t).length)));
+}
+// 駐車場の舗装を足した土地の区分を書き直す
+await sharp(globalThis.__rgb, { raw: { width: MASK.w, height: MASK.h, channels: 3 }, limitInputPixels: false }).png({ compressionLevel: 9 }).toFile(path.join(OUT, 'land.png'));
+
+fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water, curbs, medians, streetTrees, walls }));
 // ---------- ガードレール:住宅地の外で、道路の脇が 1.2m 以上落ち込んでいる所 ----------
 const guards = [];
 for (const w of osm.ways) {
