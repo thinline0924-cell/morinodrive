@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>もりの里 走行試作</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&family=Barlow+Semi+Condensed:wght@500;600&display=swap">
+<style>
+/* 画面は街の表示物の言葉づかい:住居表示板の青、地形図の地色と等高線 */
+:root {
+  --sign: #1d4e98;
+  --sign-line: #f3f5f1;
+  --paper: #eceee4;
+  --ink: #1e252b;
+  --contour: #b58858;
+  --mute: #5f676d;
+  --jp: "BIZ UDPGothic", "Hiragino Sans", "Yu Gothic", "Meiryo", sans-serif;
+  --num: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  color-scheme: light;
+}
+html, body { height: 100%; }
+[hidden] { display: none !important; }
+body { margin: 0; background: #9fb3c4; color: var(--ink); font-family: var(--jp); overflow: hidden; -webkit-font-smoothing: antialiased; }
+#view, #view canvas { position: fixed; inset: 0; display: block; outline: none; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 3px solid #f2b705; outline-offset: 3px; }
+
+/* 読み込み画面:地形図の紙 */
+#loader { position: fixed; inset: 0; background: var(--paper); display: grid; align-items: end; transition: opacity .6s ease; z-index: 20; }
+#loader.gone { opacity: 0; pointer-events: none; }
+#contours { position: absolute; inset: 0; width: 100%; height: 100%; }
+.load-body { position: relative; display: grid; gap: 18px; max-width: 520px;
+  padding-block: 0 max(48px, env(safe-area-inset-bottom, 0px));
+  padding-left: max(40px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); }
+.place { margin: 0; font-size: 15px; letter-spacing: .12em; color: var(--mute); }
+.title { margin: 0; font-size: clamp(40px, 7vw, 72px); font-weight: 700; letter-spacing: .04em; line-height: 1.05; }
+.title small { display: block; margin-top: 10px; font-size: 16px; font-weight: 400; letter-spacing: .1em; color: var(--mute); }
+.progress { height: 2px; background: rgba(30,37,43,.15); overflow: hidden; }
+#load-bar { height: 100%; background: var(--ink); transform: scaleX(0); transform-origin: left; transition: transform .2s linear; }
+#load-status { margin: 0; font-size: 14px; color: var(--mute); font-variant-numeric: tabular-nums; }
+#start { justify-self: start; display: inline-flex; align-items: baseline; gap: 14px; padding: 14px 26px; border: 0; background: var(--ink); color: var(--paper); font-size: 18px; font-weight: 700; letter-spacing: .1em; cursor: pointer; }
+#start span { font-size: 12px; font-weight: 400; opacity: .7; letter-spacing: .05em; }
+#start:hover { background: #000; }
+.note { margin: 0; font-size: 13px; line-height: 1.7; color: var(--mute); text-wrap: pretty; }
+
+/* 住居表示板 */
+#plate { position: fixed; z-index: 5; top: max(20px, env(safe-area-inset-top, 0px)); left: max(20px, env(safe-area-inset-left, 0px));
+  display: grid; gap: 2px; padding: 10px 18px 9px; min-width: 170px; background: var(--sign); color: var(--sign-line);
+  box-shadow: inset 0 0 0 3px var(--sign), inset 0 0 0 5px var(--sign-line), 0 1px 3px rgba(0,0,0,.25);
+  opacity: 0; transform: translateY(-6px); transition: opacity .5s ease, transform .5s ease; pointer-events: none; }
+#plate.on { opacity: 1; transform: none; }
+#plate-name { font-size: 22px; font-weight: 700; letter-spacing: .08em; }
+#plate-roman { font-family: var(--num); font-size: 13px; letter-spacing: .06em; opacity: .9; }
+
+/* 操作の案内:案内標識の体裁 */
+#help { position: fixed; z-index: 5; left: max(20px, env(safe-area-inset-left, 0px)); bottom: max(20px, env(safe-area-inset-bottom, 0px));
+  background: var(--sign); color: var(--sign-line); padding: 14px 18px 12px;
+  box-shadow: inset 0 0 0 3px var(--sign), inset 0 0 0 5px var(--sign-line); font-size: 13px; width: min(330px, calc(100vw - 40px)); box-sizing: border-box; }
+#help dl { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 0; }
+#help dt { font-family: var(--num); font-weight: 600; font-size: 14px; letter-spacing: .04em; white-space: nowrap; }
+#help dd { margin: 0; }
+#help p { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid rgba(243,245,241,.35); font-size: 12px; opacity: .9; }
+
+/* 後ろからの視点のときだけ出す速度 */
+#speed { position: fixed; z-index: 5; right: max(28px, env(safe-area-inset-right, 0px)); bottom: max(22px, env(safe-area-inset-bottom, 0px));
+  color: #fff; font-family: var(--num); text-shadow: 0 1px 2px rgba(0,0,0,.55), 0 0 12px rgba(0,0,0,.25); text-align: right; pointer-events: none; }
+#speed-num { font-size: 52px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
+#speed small { display: block; font-size: 15px; font-weight: 500; letter-spacing: .08em; }
+
+/* 一時停止 */
+#pause { position: fixed; inset: 0; z-index: 10; background: rgba(20,26,31,.55); display: grid; place-items: center; }
+.pause-panel { background: var(--paper); min-width: 260px; padding: 22px 0 10px; box-shadow: 0 8px 30px rgba(0,0,0,.3); }
+.pause-panel h2 { margin: 0 24px 12px; font-size: 13px; font-weight: 400; letter-spacing: .14em; color: var(--mute); }
+.pause-panel button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 12px 24px; border: 0; background: none; text-align: left; font-size: 17px; cursor: pointer; }
+.pause-panel button:hover, .pause-panel button:focus-visible { background: var(--ink); color: var(--paper); outline: none; }
+.pause-panel kbd { font-family: var(--num); font-size: 14px; opacity: .6; }
+
+@media (max-width: 640px) { #help { font-size: 12px; } #help dl { gap: 4px 10px; } }
+@media (prefers-reduced-motion: reduce) { #loader, #plate { transition: none; } }
+</style>
+</head>
+<body>
+<div id="view"></div>
+
+<div id="plate" aria-live="polite"><span id="plate-name"></span><span id="plate-roman"></span></div>
+
+<div id="speed" hidden><span id="speed-num">0</span><small>km/h</small></div>
+
+<aside id="help" hidden aria-label="操作方法">
+  <dl>
+    <dt>W / ↑</dt><dd>アクセル</dd>
+    <dt>S / ↓</dt><dd>ブレーキ(止まって長押しで後退)</dd>
+    <dt>A D / ← →</dt><dd>ハンドル</dd>
+    <dt>Space</dt><dd>サイドブレーキ</dd>
+    <dt>C</dt><dd>視点を切り替え(後ろ・運転席)</dd>
+    <dt>ドラッグ</dt><dd>見回す</dd>
+    <dt>R</dt><dd>道路に戻る</dd>
+    <dt>Esc</dt><dd>一時停止</dd>
+  </dl>
+  <p>ゲームパッド:RT アクセル/LT ブレーキ/左スティック ハンドル/Y 視点/右スティック 見回す<br>H でこの案内を出し入れ</p>
+</aside>
+
+<div id="pause" hidden>
+  <div class="pause-panel" role="dialog" aria-label="一時停止">
+    <h2>一時停止中</h2>
+    <button data-act="resume">走行に戻る <kbd>Esc</kbd></button>
+    <button data-act="camera">視点を切り替える <kbd>C</kbd></button>
+    <button data-act="reset">道路に戻る <kbd>R</kbd></button>
+    <button data-act="help">操作方法を表示 <kbd>H</kbd></button>
+  </div>
+</div>
+
+<div id="loader">
+  <canvas id="contours" aria-hidden="true"></canvas>
+  <div class="load-body">
+    <p class="place">石川県金沢市 もりの里・田上・若松</p>
+    <h1 class="title">もりの里<small>走行試作 第1版</small></h1>
+    <div class="progress"><div id="load-bar"></div></div>
+    <p id="load-status">読み込んでいます</p>
+    <button id="start" hidden>出発する<span>Enter</span></button>
+    <p class="note">今回は車の確認用の仮のコースです。実際の街並みは地図データを取り込んでから入ります。<br>キーボードかゲームパッドで操作します。</p>
+  </div>
+</div>
+
+<script>
+// 読み込み画面の等高線(地形図の茶色の線)
+(() => {
+  const c = document.getElementById('contours');
+  const g = c.getContext('2d');
+  const draw = () => {
+    const dpr = Math.min(devicePixelRatio, 2);
+    const W = c.clientWidth, H = c.clientHeight;
+    c.width = W * dpr; c.height = H * dpr; g.scale(dpr, dpr);
+    const f = (x, y) => {
+      x /= 140; y /= 140;
+      return 3.2 * Math.exp(-((x - W / 140 * 0.72) ** 2 + (y - H / 140 * 0.3) ** 2) / 2.2)
+        + 1.9 * Math.exp(-((x - W / 140 * 0.95) ** 2 + (y - H / 140 * 0.75) ** 2) / 1.4)
+        + 0.35 * Math.sin(x * 1.3 + y * 0.7) + 0.25 * Math.cos(x * 0.5 - y * 1.6);
+    };
+    const s = 10, nx = Math.ceil(W / s) + 1, ny = Math.ceil(H / s) + 1;
+    const v = new Float32Array(nx * ny);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) v[j * nx + i] = f(i * s, j * s);
+    for (let L = -1; L < 5; L += 0.25) {
+      const major = Math.abs(L - Math.round(L)) < 1e-6;
+      g.strokeStyle = major ? 'rgba(181,136,88,.55)' : 'rgba(181,136,88,.28)';
+      g.lineWidth = major ? 1.3 : 0.8;
+      g.beginPath();
+      for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+        const a = v[j * nx + i], b = v[j * nx + i + 1], cc = v[(j + 1) * nx + i + 1], d = v[(j + 1) * nx + i];
+        const pts = [];
+        const e = (p, q, x0, y0, x1, y1) => { if ((p > L) !== (q > L)) { const t = (L - p) / (q - p); pts.push([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t]); } };
+        const X = i * s, Y = j * s;
+        e(a, b, X, Y, X + s, Y); e(b, cc, X + s, Y, X + s, Y + s); e(cc, d, X + s, Y + s, X, Y + s); e(d, a, X, Y + s, X, Y);
+        for (let k = 0; k + 1 < pts.length; k += 2) { g.moveTo(...pts[k]); g.lineTo(...pts[k + 1]); }
+      }
+      g.stroke();
+    }
+  };
+  draw();
+  addEventListener('resize', () => { g.setTransform(1, 0, 0, 1, 0, 0); draw(); });
+  addEventListener('keydown', (e) => {
+    const b = document.getElementById('start');
+    if (e.key === 'Enter' && !b.hidden && !document.getElementById('loader').hidden) b.click();
+  });
+})();
+</script>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/build/three.module.js", "three/addons/": "./vendor/three/jsm/" } }
+</script>
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>

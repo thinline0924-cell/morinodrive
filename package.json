@@ -1,0 +1,20 @@
+{
+  "name": "morinodrive",
+  "private": true,
+  "type": "module",
+  "description": "金沢市もりの里・田上・若松を車で自由に走るブラウザゲーム",
+  "scripts": {
+    "serve": "python3 -m http.server 8000",
+    "car:plate": "node tools/car/plate.mjs tools/car/work/plate.png",
+    "car:build": "node tools/car/build-car.mjs tools/car/input/car.glb assets/car.glb tools/car/work/plate.png",
+    "test:physics": "node tools/test/phys-test.mjs"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.5.1",
+    "@gltf-transform/extensions": "^4.5.1",
+    "@gltf-transform/functions": "^4.5.1",
+    "meshoptimizer": "^1.3.0",
+    "sharp": "^0.35.5",
+    "three": "0.170.0"
+  }
+}

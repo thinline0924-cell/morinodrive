@@ -1,0 +1,271 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+import { Course } from './course.js';
+import { Vehicle, SPEC } from './vehicle.js';
+import { Instruments } from './instruments.js';
+import { Input } from './input.js';
+
+const $ = (id) => document.getElementById(id);
+const ui = {
+  loader: $('loader'), bar: $('load-bar'), status: $('load-status'), start: $('start'),
+  plate: $('plate'), plateName: $('plate-name'), plateRoman: $('plate-roman'),
+  help: $('help'), speed: $('speed'), speedNum: $('speed-num'), pause: $('pause'),
+};
+
+// ---------- 描画の土台 ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.72;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+$('view').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 6000);
+
+// 空と太陽(晴れた日の午後、南西寄りから)
+const sky = new Sky();
+sky.scale.setScalar(5000);
+const su = sky.material.uniforms;
+su.turbidity.value = 3.2; su.rayleigh.value = 2.4; su.mieCoefficient.value = 0.004; su.mieDirectionalG.value = 0.8;
+const sunDir = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 40), THREE.MathUtils.degToRad(215));
+su.sunPosition.value.copy(sunDir);
+scene.add(sky);
+{
+  const pm = new THREE.PMREMGenerator(renderer);
+  const envScene = new THREE.Scene();
+  const s2 = new Sky(); s2.scale.setScalar(1000);
+  Object.assign(s2.material.uniforms.sunPosition.value, sunDir);
+  for (const k of ['turbidity', 'rayleigh', 'mieCoefficient', 'mieDirectionalG']) s2.material.uniforms[k].value = su[k].value;
+  envScene.add(s2);
+  scene.environment = pm.fromScene(envScene, 0, 0.1, 2000).texture;
+  scene.environmentIntensity = 0.55;
+}
+scene.fog = new THREE.FogExp2(0xb4c8dc, 0.00038);
+
+const hemi = new THREE.HemisphereLight(0xd6e8f8, 0x6b7552, 1.1);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff1dc, 3.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+const sc = sun.shadow.camera;
+sc.left = -45; sc.right = 45; sc.top = 45; sc.bottom = -45; sc.near = 1; sc.far = 400;
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03;
+scene.add(sun, sun.target);
+
+// ---------- 土地 ----------
+const course = new Course();
+course.build(scene, renderer);
+
+// ---------- 車 ----------
+const manager = new THREE.LoadingManager();
+manager.onProgress = () => {};
+const loader = new GLTFLoader(manager);
+loader.setMeshoptDecoder(MeshoptDecoder);
+
+let vehicle, carRoot, instruments, steering, wheelNodes = {};
+const input = new Input();
+let camMode = 'chase';
+let paused = false;
+let started = false;
+
+function setProgress(p, text) {
+  ui.bar.style.transform = `scaleX(${p})`;
+  ui.status.textContent = text;
+}
+
+// 車のデータは配信の都合で base64 のテキストにしてある。読み込みながら進み具合を出す
+async function fetchCar(url, approxBytes) {
+  // 手元のサーバーでは .glb をそのまま、配信先では base64 のテキストを読む
+  const raw = await fetch('assets/car.glb').catch(() => null);
+  if (raw && raw.ok && !/text|html/.test(raw.headers.get('content-type') || '')) {
+    setProgress(0.9, '車を読み込んでいます');
+    return raw.arrayBuffer();
+  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = Number(res.headers.get('content-length')) || approxBytes;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    const p = Math.min(1, got / total);
+    setProgress(p * 0.95, `車を読み込んでいます ${Math.round(p * 100)}%`);
+  }
+  const text = new TextDecoder().decode(await new Blob(chunks).arrayBuffer());
+  const bin = atob(text.trim());
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+fetchCar('assets/car.b64.txt', 4363048).then((buf) => new Promise((ok, ng) => loader.parse(buf, '', ok, ng))).then((gltf) => {
+  carRoot = gltf.scene;
+  carRoot.traverse((o) => {
+    if (o.isMesh) {
+      o.castShadow = true;
+      o.receiveShadow = true;
+      const m = o.material;
+      if (m && m.transparent) { o.castShadow = false; m.depthWrite = false; }
+    }
+  });
+  scene.add(carRoot);
+  const defs = [];
+  for (const n of ['FL', 'FR', 'RL', 'RR']) {
+    const hub = carRoot.getObjectByName('wheel_' + n);
+    wheelNodes[n] = { hub, spin: carRoot.getObjectByName('spin_' + n), rest: hub.position.clone() };
+    defs.push({ name: n, pos: hub.position.clone(), radius: hub.userData.radius || 0.312 });
+  }
+  steering = carRoot.getObjectByName('steering');
+  steering.userData.axisV = new THREE.Vector3(...steering.userData.axis);
+  steering.userData.q0 = steering.quaternion.clone();
+  vehicle = new Vehicle(course, defs);
+  const sp = course.spawnNear(-120, 160);
+  vehicle.reset(sp.x, sp.z, sp.heading);
+  instruments = new Instruments(carRoot, course, renderer);
+  setProgress(1, '準備ができました');
+  ui.start.hidden = false;
+  ui.start.focus();
+}).catch((err) => {
+  ui.status.textContent = '車のデータを読み込めませんでした。ページを再読み込みしてください。';
+  console.error(err);
+});
+
+ui.start.addEventListener('click', () => {
+  started = true;
+  ui.loader.classList.add('gone');
+  setTimeout(() => (ui.loader.hidden = true), 700);
+  showPlate('試走コース', 'Test course');
+  ui.help.hidden = false;
+  helpTimer = 14;
+  renderer.domElement.focus();
+});
+
+// ---------- 画面上の表示 ----------
+let plateTimer = 0, helpTimer = 0;
+function showPlate(name, roman) {
+  ui.plateName.textContent = name;
+  ui.plateRoman.textContent = roman;
+  ui.plate.classList.add('on');
+  plateTimer = 5;
+}
+input.on('camera', () => { if (started && !paused) camMode = camMode === 'chase' ? 'cockpit' : 'chase'; lookYaw = lookPitch = 0; input.mouseLook.x = input.mouseLook.y = 0; });
+input.on('reset', () => {
+  if (!vehicle || !started) return;
+  const sp = course.spawnNear(vehicle.pos.x, vehicle.pos.z);
+  vehicle.reset(sp.x, sp.z, sp.heading);
+  chase.init = false;
+});
+input.on('help', () => { if (started) { ui.help.hidden = !ui.help.hidden; helpTimer = ui.help.hidden ? 0 : 999; } });
+input.on('pause', () => { if (started) setPaused(!paused); });
+function setPaused(p) {
+  paused = p;
+  ui.pause.hidden = !p;
+  if (p) ui.pause.querySelector('button').focus();
+}
+ui.pause.addEventListener('click', (e) => {
+  const a = e.target.closest('button')?.dataset.act;
+  if (!a) return;
+  if (a === 'resume') setPaused(false);
+  if (a === 'camera') { camMode = camMode === 'chase' ? 'cockpit' : 'chase'; setPaused(false); }
+  if (a === 'reset') { input._emit('reset'); setPaused(false); }
+  if (a === 'help') { ui.help.hidden = false; helpTimer = 999; setPaused(false); }
+});
+
+// ---------- カメラ ----------
+const chase = { pos: new THREE.Vector3(), look: new THREE.Vector3(), init: false };
+let lookYaw = 0, lookPitch = 0;
+const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3(), tmpQ = new THREE.Quaternion();
+const EYE = new THREE.Vector3(-0.16, 1.43, 0.352); // 運転席の目の位置(右ハンドル、地面から 1.43m)
+
+function updateCamera(dt) {
+  const v = vehicle;
+  const fwd = tmpV.set(1, 0, 0).applyQuaternion(v.quat);
+  // 見回し(右スティック / マウスドラッグ)。離すと前に戻る
+  const tYaw = input.look.x * 1.9 + input.mouseLook.x;
+  const tPitch = input.look.y * 0.6 + input.mouseLook.y;
+  if (!input.mouseLook.active) { input.mouseLook.x *= Math.exp(-dt * 2.5); input.mouseLook.y *= Math.exp(-dt * 2.5); }
+  lookYaw += (tYaw - lookYaw) * Math.min(1, dt * 8);
+  lookPitch += (THREE.MathUtils.clamp(tPitch, -0.6, 0.5) - lookPitch) * Math.min(1, dt * 8);
+
+  if (camMode === 'cockpit') {
+    camera.fov = 64; camera.near = 0.03;
+    const eye = EYE.clone();
+    eye.x -= THREE.MathUtils.clamp(v.longAcc * 0.006, -0.04, 0.04);
+    eye.z -= THREE.MathUtils.clamp(v.latAcc * 0.005, -0.04, 0.04);
+    carRoot.localToWorld(camera.position.copy(eye));
+    tmpQ.setFromEuler(new THREE.Euler(-0.06 - lookPitch, -Math.PI / 2 - lookYaw, 0, 'YXZ'));
+    camera.quaternion.copy(carRoot.quaternion).multiply(tmpQ);
+  } else {
+    camera.fov = 58; camera.near = 0.1;
+    const flat = tmpV2.set(fwd.x, 0, fwd.z).normalize();
+    const yawQ = tmpQ.setFromAxisAngle(new THREE.Vector3(0, 1, 0), -lookYaw);
+    flat.applyQuaternion(yawQ);
+    const target = v.pos.clone().addScaledVector(flat, -6.2).add(new THREE.Vector3(0, 2.0 + lookPitch * 2, 0));
+    const look = v.pos.clone().addScaledVector(flat, 2.5).add(new THREE.Vector3(0, 0.75, 0));
+    if (!chase.init) { chase.pos.copy(target); chase.look.copy(look); chase.init = true; }
+    chase.pos.lerp(target, 1 - Math.exp(-dt * 5));
+    chase.look.lerp(look, 1 - Math.exp(-dt * 9));
+    // 地面にもぐらない
+    const gh = course.height(chase.pos.x, chase.pos.z) + 0.6;
+    if (chase.pos.y < gh) chase.pos.y = gh;
+    camera.position.copy(chase.pos);
+    camera.lookAt(chase.look);
+  }
+  camera.updateProjectionMatrix();
+}
+
+// ---------- 毎フレーム ----------
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (vehicle) {
+    const inp = input.poll();
+    if (!started || paused) { inp.accel = inp.brake = inp.steer = 0; inp.handbrake = false; }
+    if (!paused) vehicle.update(dt, inp);
+    vehicle.modelTransform(carRoot);
+    for (const w of vehicle.wheels) {
+      const n = wheelNodes[w.name];
+      n.hub.position.y = n.rest.y + (w.travel - SPEC.staticComp);
+      n.hub.rotation.y = -w.steer;
+      n.spin.rotation.z = -w.spin;
+    }
+    steering.quaternion.setFromAxisAngle(steering.userData.axisV, vehicle.steerAngle * SPEC.steerRatio).multiply(steering.userData.q0);
+    instruments.update(dt, vehicle, '試走コース');
+    updateCamera(dt);
+    // 影は車のまわりだけ細かく
+    sun.target.position.copy(vehicle.pos);
+    sun.position.copy(vehicle.pos).addScaledVector(sunDir, 200);
+    // 表示
+    const kmh = Math.round(vehicle.speed * 3.6);
+    ui.speed.hidden = !(started && camMode === 'chase');
+    ui.speedNum.textContent = kmh;
+    if (plateTimer > 0) { plateTimer -= dt; if (plateTimer <= 0) ui.plate.classList.remove('on'); }
+    if (helpTimer > 0 && helpTimer < 900 && vehicle.speed > 1) { helpTimer -= dt; if (helpTimer <= 0) ui.help.hidden = true; }
+  } else {
+    // 読み込み中はコースの上をゆっくり回る
+    const t = performance.now() / 1000;
+    camera.position.set(Math.cos(t * 0.05) * 320, 120, Math.sin(t * 0.05) * 320);
+    camera.lookAt(0, 0, 0);
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// 動作確認用(自動テストから車を動かす)
+window.__drive = { get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };

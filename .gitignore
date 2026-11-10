@@ -1,0 +1,6 @@
+node_modules/
+# 車の3Dデータは権利の確認が済むまでリポジトリに入れない
+assets/car.glb
+assets/car.b64.txt
+tools/car/input/
+tools/car/work/
