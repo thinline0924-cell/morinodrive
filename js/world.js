@@ -50,9 +50,12 @@ export class World {
     this.buildings = d.buildings;
     this.bridges = d.roads.bridges;
     this.markings = d.roads.markings;
+    this.crosswalks = d.roads.crosswalks || [];
+    this.stops = d.roads.stops || [];
     this.water = d.roads.water;
     this.lines = d.lines.lines;
     this.poles = d.lines.poles;
+    this.signals = d.lines.signals || [];
     this.places = d.places.places;
     this.trees = d.places.trees;
     this._indexBridges();
@@ -97,6 +100,7 @@ export class World {
     const l = this._land(x, z);
     if (!l) return 'grass';
     if (l[0] > 127) return 'road';
+    if (l[1] > 90 && l[1] < 170) return 'lot'; // 歩道・路肩
     if (l[2] > 60) return 'lot';
     return 'grass';
   }
@@ -176,7 +180,7 @@ export class World {
           const dx = bx - ax, dz = bz - az, L2 = dx * dx + dz * dz || 1;
           const t = Math.min(1, Math.max(0, ((x - ax) * dx + (z - az) * dz) / L2));
           const px = ax + dx * t, pz = az + dz * t, d = Math.hypot(x - px, z - pz);
-          if (!best || d < best.d) best = { d, x: px, z: pz, heading: Math.atan2(dz, dx), w: l.w };
+          if (!best || d < best.d) best = { d, x: px, z: pz, heading: Math.atan2(dz, dx), w: l.w, cw: l.cw || 5, oneway: !!l.o, name: l.n || '', limit: l.v || 0 };
         }
       }
     }
@@ -186,9 +190,8 @@ export class World {
   spawnNear(x, z, minWidth = 1) {
     const r = this.nearestRoad(x, z, minWidth) || this.nearestRoad(x, z, 0) || { x, z, heading: 0 };
     const lx = Math.sin(r.heading), lz = -Math.cos(r.heading);
-    let left = 0;
-    while (left < 12 && this._land(r.x + lx * left, r.z + lz * left)?.[0] > 127) left += 0.25;
-    const off = left > 3 ? Math.min(left / 2, 5) : 0;
+    // 左側通行:対面通行なら左半分の真ん中、一方通行なら中央
+    const off = r.oneway ? 0 : (r.cw || 5) / 4;
     return { x: r.x + lx * off, z: r.z + lz * off, heading: r.heading };
   }
 
@@ -209,6 +212,8 @@ export class World {
     this._buildMarkings(scene);
     this._buildPoles(scene);
     this._buildTrees(scene);
+    this._buildCrossings(scene);
+    this._buildSignals(scene);
   }
 
   _terrainMaterial(aniso, landTex) {
@@ -238,7 +243,12 @@ uniform vec4 landBox;`)
   vec3 wat = vec3(0.05, 0.08, 0.08);
   vec3 c = g;
   c = mix(c, lot, smoothstep(0.08, 0.45, land.b));
-  c = mix(c, wat, smoothstep(0.3, 0.7, land.g));
+  float wat_t = smoothstep(0.75, 0.95, land.g);
+  // 道路の範囲(車道+歩道)をひとまとめにしてから、車道を上に塗る(境目に草が出ないように)
+  float area = clamp(land.r + min(land.g, 0.5) * 2.0 * (1.0 - wat_t), 0.0, 1.0);
+  vec3 walk = vec3(0.36, 0.355, 0.34) * mix(0.9, 1.08, texture2D(asphaltTex, vWPos.xz * 0.6).r);
+  c = mix(c, walk, smoothstep(0.25, 0.6, area));
+  c = mix(c, wat, wat_t);
   float road = smoothstep(0.38, 0.62, land.r);
   c = mix(c, asp, road);
   diffuseColor.rgb = c;
@@ -467,7 +477,7 @@ uniform vec4 landBox;`)
         const L = Math.hypot(bx - ax, bz - az); if (L < 0.01) continue;
         const nx = -(bz - az) / L * W / 2, nz = (bx - ax) / L * W / 2;
         // 破線:5m 引いて 5m あける
-        const on = mk.s !== 'dash' || (Math.floor(dist / 5) % 2 === 0);
+        const on = (mk.s !== 'dash' && mk.s !== 'lane') || (Math.floor(dist / 5) % 2 === 0);
         dist += L;
         if (!on) continue;
         const ha = this.height(ax, az) + 0.03, hb = this.height(bx, bz) + 0.03;
@@ -524,6 +534,92 @@ uniform vec4 landBox;`)
     scene.add(ced, brd, trk);
   }
 
+  // ---------- 横断歩道と停止線 ----------
+  _buildCrossings(scene) {
+    const P = [];
+    const rect = (cx, cz, ang, along, across) => {
+      const fx = Math.cos(ang), fz = Math.sin(ang), lx = -fz, lz = fx;
+      const c = [[-along, -across], [along, -across], [along, across], [-along, across]].map(([a, b]) => {
+        const x = cx + fx * a + lx * b, z = cz + fz * a + lz * b;
+        return [x, this.height(x, z) + 0.035, z];
+      });
+      P.push(...c[0], ...c[2], ...c[1], ...c[0], ...c[3], ...c[2]);
+    };
+    for (const [x, z, ang, w] of this.crosswalks) {
+      // 道路と平行な白い帯(幅 45cm、間 45cm)を、車道の端から端まで
+      const n = Math.max(2, Math.floor((w - 0.6) / 0.9));
+      const lx = -Math.sin(ang), lz = Math.cos(ang);
+      for (let k = 0; k < n; k++) {
+        const t = -((n - 1) * 0.9) / 2 + k * 0.9;
+        rect(x + lx * t, z + lz * t, ang, 2.0, 0.225);
+      }
+    }
+    for (const [x, z, ang, len] of this.stops) rect(x, z, ang, 0.225, len / 2);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(P.length).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0xe6e6e1, roughness: 0.7, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
+    m.receiveShadow = true;
+    scene.add(m);
+  }
+
+  // ---------- 信号機:交差点ごとに 2 方向を交互に(青 26 秒・黄 3 秒・全赤 2 秒) ----------
+  _buildSignals(scene) {
+    const n = this.signals.length;
+    if (!n) return;
+    const metal = new THREE.MeshStandardMaterial({ color: 0x8e9196, roughness: 0.5, metalness: 0.4 });
+    const poleG = new THREE.CylinderGeometry(0.11, 0.13, 5.6, 8).translate(0, 2.8, 0);
+    const poles = new THREE.InstancedMesh(poleG, metal, n);
+    const arms = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.06, 0.06, 1, 6).rotateZ(Math.PI / 2).translate(0.5, 0, 0), metal, n);
+    // 灯器:横長、左から青・黄・赤(日本の配置)
+    const heads = new THREE.InstancedMesh(new THREE.BoxGeometry(0.32, 0.42, 1.28), new THREE.MeshStandardMaterial({ color: 0x5d6168, roughness: 0.6, metalness: 0.3 }), n);
+    const lamps = new THREE.InstancedMesh(new THREE.CircleGeometry(0.15, 16).rotateY(-Math.PI / 2), new THREE.MeshBasicMaterial({ toneMapped: false }), n * 3);
+    const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), S = new THREE.Vector3(1, 1, 1), V = new THREE.Vector3(), Y = new THREE.Vector3(0, 1, 0);
+    this.signalState = [];
+    for (let i = 0; i < n; i++) {
+      const [px, pz, hx, hz, ang, phase, group] = this.signals[i];
+      const gy = this.terrainHeight(px, pz);
+      // 柱(向きは関係ないので回さない)
+      M.compose(V.set(px, gy - 0.1, pz), Q.identity(), S.set(1, 1, 1)); poles.setMatrixAt(i, M);
+      // 腕:柱の上から灯器へ
+      const dx = hx - px, dz = hz - pz, L = Math.max(0.5, Math.hypot(dx, dz));
+      Q.setFromAxisAngle(Y, -Math.atan2(dz, dx));
+      M.compose(V.set(px, gy + 5.35, pz), Q, S.set(L, 1, 1)); arms.setMatrixAt(i, M);
+      // 灯器:来る車の方を向く(進む向き ang の逆)
+      Q.setFromAxisAngle(Y, -ang);
+      M.compose(V.set(hx, gy + 5.35, hz), Q, S.set(1, 1, 1)); heads.setMatrixAt(i, M);
+      // 灯の位置:灯器の座標で、車の来る側(-x)の面に、運転する人から見て左から 青・黄・赤
+      const Mh = M.clone(), T = new THREE.Matrix4();
+      for (let k = 0; k < 3; k++) {
+        T.makeTranslation(-0.17, 0, (k - 1) * 0.4);
+        lamps.setMatrixAt(i * 3 + k, Mh.clone().multiply(T));
+      }
+      this.signalState.push({ phase, group });
+    }
+    for (const im of [poles, arms, heads]) im.castShadow = true;
+    scene.add(poles, arms, heads, lamps);
+    this.lamps = lamps;
+    this._signalT = -1;
+    this.updateSignals(0);
+  }
+  updateSignals(t) {
+    if (!this.lamps) return;
+    const step = Math.floor(t * 2);
+    if (step === this._signalT) return;
+    this._signalT = step;
+    const C = [new THREE.Color(0x14cfa6), new THREE.Color(0xffb21a), new THREE.Color(0xff2a1a)];
+    const off = new THREE.Color(0x1d2226);
+    const cyc = 62;
+    this.signalState.forEach((s, i) => {
+      const tt = (t + s.group * 17.3) % cyc;
+      // 0-26 方向0 青、26-29 黄、29-31 全赤、31-57 方向1 青、57-60 黄、60-62 全赤
+      const local = s.phase === 0 ? tt : (tt + 31) % cyc;
+      const lit = local < 26 ? 0 : local < 29 ? 1 : 2;
+      for (let k = 0; k < 3; k++) this.lamps.setColorAt(i * 3 + k, k === lit ? C[k] : off);
+    });
+    this.lamps.instanceColor.needsUpdate = true;
+  }
+
   // ---------- カーナビの地図(256m 四方のタイルを描いてためておく) ----------
   navTile(tx, tz) {
     const key = `${tx},${tz}`;
@@ -545,7 +641,9 @@ uniform vec4 landBox;`)
       const bl = sample(x, z, 2), wa = sample(x, z, 1), ro = sample(x, z, 0);
       const blt = smooth(225, 250, bl);
       r += (214 - r) * blt; gg += (206 - gg) * blt; b += (190 - b) * blt;
-      const wt = smooth(100, 160, wa);
+      const sw = smooth(90, 115, wa) * (1 - smooth(180, 230, wa));
+      r += (244 - r) * sw; gg += (243 - gg) * sw; b += (236 - b) * sw;
+      const wt = smooth(190, 240, wa);
       r += (164 - r) * wt; gg += (196 - gg) * wt; b += (222 - b) * wt;
       const rt = smooth(100, 160, ro);
       r += (252 - r) * rt; gg += (251 - gg) * rt; b += (246 - b) * rt;

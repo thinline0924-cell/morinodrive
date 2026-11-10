@@ -266,6 +266,7 @@ function frame() {
         if (started) showPlate(pl.n, pl.r);
       }
     }
+    world.updateSignals(performance.now() / 1000);
     instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '');
     updateCamera(dt);
     const fc = window.__drive?.freeCam; // 確認用の上空カメラ

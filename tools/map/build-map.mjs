@@ -5,6 +5,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import earcut from 'earcut';
 import { AREA, ORIGIN, toLocal } from './area.mjs';
+import { parseOSM } from './osm.mjs';
 
 const RAW = path.join(import.meta.dirname, 'raw');
 const OUT = path.join(import.meta.dirname, '../../assets/map');
@@ -63,6 +64,50 @@ fillNaN(core.h, core.meta.nx, core.meta.nz);
 const farSrc = readF32('dem_far'); fillNaN(farSrc, grids[1].nx, grids[1].nz);
 const far = downsample(farSrc, grids[1], 2);
 fillNaN(far.h, far.meta.nx, far.meta.nz);
+// ---------- 道路沿いに高さをならす(路面のガタつきを消す) ----------
+const osm = parseOSM(JSON.parse(fs.readFileSync(path.join(RAW, 'osm.json'))));
+console.log('osm drivable ways', osm.ways.length, 'signals', osm.signals.length, 'crossings', osm.crossings.length);
+{
+  const m = core.meta, src = Float32Array.from(core.h);
+  const bil = (x, z) => {
+    const fx = (x - m.x0) / m.spacing, fz = (z - m.z0) / m.spacing;
+    const i = Math.max(0, Math.min(m.nx - 2, Math.floor(fx))), j = Math.max(0, Math.min(m.nz - 2, Math.floor(fz)));
+    const u = Math.min(1, Math.max(0, fx - i)), v = Math.min(1, Math.max(0, fz - j)), k = j * m.nx + i;
+    return (src[k] * (1 - u) + src[k + 1] * u) * (1 - v) + (src[k + m.nx] * (1 - u) + src[k + m.nx + 1] * u) * v;
+  };
+  const bestD = new Float32Array(m.nx * m.nz).fill(Infinity), target = new Float32Array(m.nx * m.nz), reach = new Float32Array(m.nx * m.nz);
+  for (const w of osm.ways) {
+    if (w.tunnel || w.bridge) continue;
+    const sm = [];
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const [a, b] = [w.pts[i], w.pts[i + 1]];
+      const n = Math.max(1, Math.round(Math.hypot(b[0] - a[0], b[1] - a[1]) / 2));
+      for (let k = 0; k < n; k++) sm.push([a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n]);
+    }
+    sm.push(w.pts.at(-1));
+    const raw = sm.map(([x, z]) => bil(x, z));
+    // 道路に沿ってなめらかに(σ ≒ 12m)
+    const sig = 6, Kw = 18;
+    const hs = raw.map((_, i) => { let s2 = 0, c = 0; for (let k = -Kw; k <= Kw; k++) { const j = Math.min(raw.length - 1, Math.max(0, i + k)); const g = Math.exp(-(k * k) / (2 * sig * sig)); s2 += raw[j] * g; c += g; } return s2 / c; });
+    const R = w.w / 2 + 18;
+    sm.forEach(([x, z], si) => {
+      for (let j = Math.floor((z - R - m.z0) / m.spacing); j <= Math.ceil((z + R - m.z0) / m.spacing); j++) for (let i = Math.floor((x - R - m.x0) / m.spacing); i <= Math.ceil((x + R - m.x0) / m.spacing); i++) {
+        if (i < 0 || j < 0 || i >= m.nx || j >= m.nz) continue;
+        const d = Math.hypot(m.x0 + i * m.spacing - x, m.z0 + j * m.spacing - z), k = j * m.nx + i;
+        if (d < bestD[k]) { bestD[k] = d; target[k] = hs[si]; reach[k] = w.w / 2; }
+      }
+    });
+  }
+  let changed = 0, maxd = 0;
+  for (let k = 0; k < core.h.length; k++) {
+    if (!Number.isFinite(bestD[k])) continue;
+    const t = 1 - Math.min(1, Math.max(0, (bestD[k] - (reach[k] + 6)) / 10));
+    if (t <= 0) continue;
+    const nh = core.h[k] + (target[k] - core.h[k]) * t * t * (3 - 2 * t);
+    maxd = Math.max(maxd, Math.abs(nh - core.h[k])); core.h[k] = nh; changed++;
+  }
+  console.log('road flattening: grid nodes changed', changed, 'max change', maxd.toFixed(2), 'm');
+}
 await writeHeightPng('height_core', core.h, core.meta);
 await writeHeightPng('height_far', far.h, far.meta);
 console.log('height core', core.meta.nx, 'x', core.meta.nz, '@', core.meta.spacing, 'm / far', far.meta.nx, 'x', far.meta.nz, '@', far.meta.spacing, 'm');
@@ -222,7 +267,24 @@ MASK.w = MASK.x1 - MASK.x0; MASK.h = MASK.z1 - MASK.z0;
   for (const b of buildings) svg += `<polygon points="${P(b.p)}" fill="${g(4)}"/>`;
   svg += '</svg>';
   const raw = await sharp(Buffer.from(svg), { limitInputPixels: false }).extractChannel(0).raw().toBuffer();
-  // ゲーム用:R 道路(橋を含む) G 水面 B 建物(255)とその周りの敷地(距離で薄くなる)
+  // 車道:OpenStreetMap の道路の中心線を車道の幅で太らせる(PLATEAU の道路の面の外にははみ出さない)
+  const LP = (pts) => pts.map((q) => `${(q[0] - MASK.x0).toFixed(1)},${(q[1] - MASK.z0).toFixed(1)}`).join(' ');
+  const strokeSvg = (items) => `<svg xmlns="http://www.w3.org/2000/svg" width="${MASK.w}" height="${MASK.h}"><rect width="100%" height="100%" fill="#000"/>${items.map(([pts, w]) => `<polyline points="${LP(pts)}" fill="none" stroke="#fff" stroke-width="${w}" stroke-linejoin="round" stroke-linecap="round"/>`).join('')}</svg>`;
+  const render = async (svgText) => sharp(Buffer.from(svgText), { limitInputPixels: false }).extractChannel(0).raw().toBuffer();
+  const carr = await render(strokeSvg(osm.ways.filter((w) => !w.tunnel).map((w) => [w.pts, w.w])));
+  // OSM に無い細い道は、国土地理院の中心線から幅 4.5m で補う
+  const near = await render(strokeSvg(osm.ways.map((w) => [w.pts, 16])));
+  const nearAt = (x, z) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); return i >= 0 && j >= 0 && i < MASK.w && j < MASK.h && near[j * MASK.w + i] > 127; };
+  const extra = [];
+  for (const ln of lines) for (let i = 0; i + 3 < ln.p.length; i += 2) {
+    const mx = (ln.p[i] + ln.p[i + 2]) / 2, mz = (ln.p[i + 1] + ln.p[i + 3]) / 2;
+    if (!nearAt(mx, mz)) extra.push([[[ln.p[i], ln.p[i + 1]], [ln.p[i + 2], ln.p[i + 3]]], 4.5]);
+  }
+  const carr2 = await render(strokeSvg(extra));
+  // 道路の面(なめらかな縁):境目のギザギザを減らすため、ここだけはアンチエイリアスありで描く
+  const roadAA = await render(`<svg xmlns="http://www.w3.org/2000/svg" width="${MASK.w}" height="${MASK.h}"><rect width="100%" height="100%" fill="#000"/>${plateau.roads.map((r) => `<path d="${[r.p, ...(r.hl || [])].map((ring) => 'M' + ring.map((q) => `${(q[0] - MASK.x0).toFixed(2)},${(q[1] - MASK.z0).toFixed(2)}`).join('L') + 'Z').join('')}" fill-rule="evenodd" fill="#fff"/>`).join('')}${bridges.map((b) => `<polygon points="${P(b.p)}" fill="#000"/>`).join('')}</svg>`);
+  let cPix = 0, sPix = 0;
+  // ゲーム用:R 車道 G 水面(255)/歩道など道路の残り(128) B 建物(255)とその周りの敷地(距離で薄くなる)
   const N = MASK.w * MASK.h;
   const dist = new Float32Array(N).fill(1e9);
   for (let k = 0; k < N; k++) if (raw[k] === 4) dist[k] = 0;
@@ -232,13 +294,17 @@ MASK.w = MASK.x1 - MASK.x0; MASK.h = MASK.z1 - MASK.z0;
   const rgb = Buffer.alloc(N * 3);
   for (let k = 0; k < N; k++) {
     const v = raw[k];
-    rgb[k * 3] = v === 1 ? 255 : 0; // 橋は別の形で描くので地形には塗らない
-    rgb[k * 3 + 1] = v === 3 ? 255 : 0;
+    // 車道 = 中心線を太らせた形と道路の面の重なり(どちらも縁はなめらか)。橋は別の形で描くので地形には塗らない
+    const ra = v === 4 ? 0 : roadAA[k];
+    const cr = Math.min(ra, Math.max(carr[k], carr2[k]));
+    rgb[k * 3] = cr;
+    rgb[k * 3 + 1] = v === 3 && ra < 128 ? 255 : Math.round(Math.max(0, ra - cr) / 2);
+    if (cr > 127) cPix++; else if (ra > 127) sPix++;
     rgb[k * 3 + 2] = v === 4 ? 255 : dist[k] < 7 ? Math.round(190 * (1 - dist[k] / 7)) : 0;
   }
   await sharp(rgb, { raw: { width: MASK.w, height: MASK.h, channels: 3 }, limitInputPixels: false }).png({ compressionLevel: 9 }).toFile(path.join(OUT, 'land.png'));
   const hist = [0, 0, 0, 0, 0]; for (const v of raw) hist[Math.min(4, v)]++;
-  console.log('land mask', MASK.w, 'x', MASK.h, 'histogram', hist.join(' '));
+  console.log('land mask', MASK.w, 'x', MASK.h, 'histogram', hist.join(' '), '/ carriageway', cPix, 'sidewalk etc', sPix, '/ gsi fallback segments', extra.length);
   globalThis.__mask = raw;
 }
 
@@ -287,19 +353,6 @@ for (const ln of lines) {
   const ok = W.map((w, i) => w[0] > 0.8 && w[1] > 0.8 && w[0] < med(W, i, 0) * 1.35 + 0.3 && w[1] < med(W, i, 1) * 1.35 + 0.3);
   const runs = (fn) => { const out = []; let cur = []; sm.forEach((s3, i) => { const p = ok[i] ? fn(s3, i) : null; if (p) cur.push(p[0], p[1]); else { if (cur.length >= 6) out.push(cur); cur = []; } }); if (cur.length >= 6) out.push(cur); return out; };
   const total = (w) => w[0] + w[1];
-  if (ln.w >= 2 && !ln.m) {
-    const style = ln.w >= 3 ? (ln.c <= 1 ? 'yellow' : 'white') : 'dash';
-    for (const r of runs(([x, z], i) => (total(W[i]) >= 5 ? [x, z] : null))) markings.push({ s: style, p: r.map(r1) });
-  }
-  if (ln.w >= 2) {
-    for (const side of [-1, 1]) {
-      for (const r of runs(([x, z, a], i) => {
-        const d = W[i][side < 0 ? 0 : 1] - 0.35;
-        if (total(W[i]) < 5.5 || d < 2) return null;
-        return [x - Math.sin(a) * d * side, z + Math.cos(a) * d * side];
-      })) markings.push({ s: 'edge', p: r.map(r1) });
-    }
-  }
   // 電柱:だいたい 35m おき、道路の外の地面に
   for (let i = 0; i < sm.length; i++) {
     poleAcc += 2;
@@ -314,17 +367,108 @@ for (const ln of lines) {
     poleAcc = 0; poleSide = -poleSide;
   }
 }
-console.log('markings', markings.length, 'poles', poles.length / 3);
+// ---------- 区画線(OpenStreetMap の車線数・一方通行・道路の種類から) ----------
+const MAJOR = new Set(['trunk', 'primary', 'secondary', 'trunk_link', 'primary_link', 'secondary_link', 'motorway']);
+// 交差点の手前で線を切る距離
+const trimAt = new Map();
+for (const id of osm.junction) {
+  let mw = 0;
+  for (const w of osm.ways) if (w.nodes.includes(id)) mw = Math.max(mw, w.w);
+  trimAt.set(id, mw / 2 + 2.5);
+}
+const offsetLine = (sm, off) => sm.map(([x, z, a]) => [x - Math.sin(a) * off, z + Math.cos(a) * off]);
+for (const w of osm.ways) {
+  if (w.tunnel) continue;
+  // 1m おきに並べ、交差点の近くは使わない
+  const sm = [];
+  const jPts = w.nodes.map((id, i) => (trimAt.has(id) ? [w.pts[i], trimAt.get(id)] : null)).filter(Boolean);
+  for (let i = 0; i < w.pts.length - 1; i++) {
+    const [a, b] = [w.pts[i], w.pts[i + 1]];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]), n = Math.max(1, Math.round(L));
+    const ang = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    for (let k = 0; k < n; k++) {
+      const x = a[0] + (b[0] - a[0]) * k / n, z = a[1] + (b[1] - a[1]) * k / n;
+      const cut = jPts.some(([q, t]) => Math.hypot(q[0] - x, q[1] - z) < t);
+      sm.push(cut ? null : [x, z, ang]);
+    }
+  }
+  const runs = [];
+  let cur = [];
+  for (const q of sm) { if (q) cur.push(q); else { if (cur.length > 4) runs.push(cur); cur = []; } }
+  if (cur.length > 4) runs.push(cur);
+  const major = MAJOR.has(w.hw);
+  for (const run of runs) {
+    const push = (style, off) => markings.push({ s: style, p: offsetLine(run, off).flat().map(r1) });
+    if (!w.oneway && w.w >= 5.5 && (w.lanes >= 2 || major)) {
+      push(w.lanes >= 4 || major ? 'yellow' : 'dash', 0);
+      const per = Math.floor(w.lanes / 2);
+      for (let k = 1; k < per; k++) { push('lane', k * w.laneW); push('lane', -k * w.laneW); }
+    }
+    if (w.oneway && w.lanes >= 2) for (let k = 1; k < w.lanes; k++) push('lane', -w.lanes * w.laneW / 2 + k * w.laneW);
+    if (w.w >= 5.5 && (major || w.lanes >= 2 || w.hw === 'tertiary')) { push('edge', w.w / 2 - 0.35); push('edge', -(w.w / 2 - 0.35)); }
+  }
+}
+// 横断歩道(しま模様)
+const crosswalks = [];
+for (const c of osm.crossings) {
+  const w = osm.ways.find((ww) => ww.nodes.includes(c.id));
+  if (!w || w.w < 4.5 || w.tunnel) continue;
+  const i = w.nodes.indexOf(c.id);
+  const a = w.pts[Math.max(0, i - 1)], b = w.pts[Math.min(w.pts.length - 1, i + 1)];
+  crosswalks.push([r1(c.xz[0]), r1(c.xz[1]), Math.round(Math.atan2(b[1] - a[1], b[0] - a[0]) * 1000) / 1000, r1(w.w)]);
+}
+// 信号機と停止線:信号のノードごとに、そこへ入ってくる方向それぞれに1基
+const signals = [], stops = [];
+const groups = [];
+for (const sgn of osm.signals) {
+  const inc = [];
+  for (const w of osm.ways) {
+    const i = w.nodes.indexOf(sgn.id);
+    if (i < 0 || w.tunnel) continue;
+    const P = w.pts[i];
+    // 手前側の向き(ノードから離れる向き)。そこから来る車が信号を見る
+    if (i > 0) inc.push({ w, back: w.pts[i - 1], fwdAllowed: true });
+    if (i < w.pts.length - 1) inc.push({ w, back: w.pts[i + 1], fwdAllowed: !w.oneway });
+  }
+  if (!inc.length) continue;
+  let g = groups.find((q) => Math.hypot(q[0] - sgn.xz[0], q[1] - sgn.xz[1]) < 40);
+  if (!g) { g = [sgn.xz[0], sgn.xz[1], groups.length]; groups.push(g); }
+  const span = Math.max(...inc.map((q) => q.w.w));
+  const a0 = Math.atan2(sgn.xz[1] - inc[0].back[1], sgn.xz[0] - inc[0].back[0]);
+  for (const q of inc) {
+    if (!q.fwdAllowed) continue;
+    const L = Math.hypot(sgn.xz[0] - q.back[0], sgn.xz[1] - q.back[1]) || 1;
+    const tx = (sgn.xz[0] - q.back[0]) / L, tz = (sgn.xz[1] - q.back[1]) / L; // 進む向き
+    const lx = tz, lz = -tx; // 進む向きの左
+    const ang = Math.atan2(tz, tx);
+    const phase = Math.abs(Math.cos(ang - a0)) > 0.7 ? 0 : 1;
+    const far = span / 2 + 3;
+    const hw = q.w.oneway ? q.w.w / 2 : q.w.w / 2;
+    // 交差点の向こう側、左の路肩に柱。腕を道路の上へ出して、灯器は左側の車線の上
+    const px = sgn.xz[0] + tx * far + lx * (hw + 1.0), pz = sgn.xz[1] + tz * far + lz * (hw + 1.0);
+    const hx = sgn.xz[0] + tx * far + lx * (q.w.oneway ? 0 : hw / 2), hz = sgn.xz[1] + tz * far + lz * (q.w.oneway ? 0 : hw / 2);
+    signals.push([r1(px), r1(pz), r1(hx), r1(hz), Math.round(ang * 1000) / 1000, phase, g[2]]);
+    // 停止線:交差点の手前、左側の車線を横切る
+    const d = span / 2 + 4.5;
+    const cx = sgn.xz[0] - tx * d + lx * (q.w.oneway ? 0 : hw / 2), cz = sgn.xz[1] - tz * d + lz * (q.w.oneway ? 0 : hw / 2);
+    stops.push([r1(cx), r1(cz), Math.round(ang * 1000) / 1000, r1(q.w.oneway ? q.w.w - 0.6 : hw - 0.3)]);
+  }
+}
+console.log('markings', markings.length, 'crosswalks', crosswalks.length, 'signal heads', signals.length, 'intersections', groups.length, 'stop lines', stops.length, 'poles', poles.length / 3);
 
 const meta = {
-  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル)、国土交通省 PLATEAU 金沢市 2024。加工して作成',
+  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル)、国土交通省 PLATEAU 金沢市 2024、© OpenStreetMap contributors(ODbL)。加工して作成',
   origin: ORIGIN, area: AREA,
   height: { core: core.meta, far: far.meta, scale: 0.01 },
   land: { x0: MASK.x0, z0: MASK.z0, w: MASK.w, h: MASK.h },
 };
 fs.writeFileSync(path.join(OUT, 'meta.json'), JSON.stringify(meta, null, 1));
 fs.writeFileSync(path.join(OUT, 'buildings.json'), JSON.stringify(buildings));
-fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, water }));
-fs.writeFileSync(path.join(OUT, 'lines.json'), JSON.stringify({ lines: lines.map((l) => ({ w: l.w, c: l.c, p: l.p.map(r1) })), poles }));
+fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water }));
+const RANK = { trunk: 3, primary: 3, motorway: 3, secondary: 2, tertiary: 2, unclassified: 1, residential: 1, living_street: 1, service: 0 };
+fs.writeFileSync(path.join(OUT, 'lines.json'), JSON.stringify({
+  lines: osm.ways.filter((w) => !w.tunnel).map((w) => ({ w: RANK[w.hw.replace('_link', '')] ?? 1, cw: r1(w.w), o: w.oneway ? 1 : 0, n: w.name || w.ref || undefined, v: w.maxspeed || undefined, p: w.pts.flat().map(r1) })),
+  poles, signals,
+}));
 fs.writeFileSync(path.join(OUT, 'places.json'), JSON.stringify({ places, trees }));
 for (const f of fs.readdirSync(OUT)) console.log(f, (fs.statSync(path.join(OUT, f)).size / 1e6).toFixed(2), 'MB');
