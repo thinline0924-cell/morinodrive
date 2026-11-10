@@ -465,9 +465,11 @@ console.log('trees', nForest, 'garden plants', trees.length / 4 - nForest);
 
 // ---------- 区画線・電柱:中心線から左右に道路の面の端を探して幅を測る ----------
 const isRoad = (x, z) => { const v = maskAt(x, z); return v === 1 || v === 2; };
-const markings = [], poles = [];
+const markings = [], poles = [], wires = [];
+let lineIdx = -1, lastPole = null;
 let poleAcc = 0, poleSide = 1;
 for (const ln of lines) {
+  lineIdx++;
   if (ln.w < 1) continue;
   const pts = []; for (let i = 0; i < ln.p.length; i += 2) pts.push([ln.p[i], ln.p[i + 1]]);
   // 2m おきに並べ直す
@@ -496,7 +498,10 @@ for (const ln of lines) {
     let clear = true;
     for (const [dx, dz] of [[0, 0], [0.6, 0], [-0.6, 0], [0, 0.6], [0, -0.6]]) if (maskAt(px + dx, pz + dz) !== 0) clear = false;
     if (!clear) continue;
+    const pi = poles.length / 3;
     poles.push(r1(px), r1(pz), Math.round(((a + Math.PI) / (2 * Math.PI)) * 255));
+    if (lastPole && lastPole.line === lineIdx && Math.hypot(lastPole.x - px, lastPole.z - pz) < 55) wires.push(lastPole.i, pi);
+    lastPole = { i: pi, x: px, z: pz, line: lineIdx };
     poleAcc = 0; poleSide = -poleSide;
   }
 }
@@ -509,7 +514,19 @@ for (const id of osm.junction) {
   for (const w of osm.ways) if (w.nodes.includes(id)) mw = Math.max(mw, w.w);
   trimAt.set(id, mw / 2 + 2.5);
 }
-const offsetLine = (sm, off) => sm.map(([x, z, a]) => [x - Math.sin(a) * off, z + Math.cos(a) * off]);
+const offsetLine = (sm, off) => {
+  const pts = sm.map(([x, z, a]) => [x - Math.sin(a) * off, z + Math.cos(a) * off]);
+  // まっすぐな所は点を間引く(向きの変化 0.6° 未満、最大 4m)。地形に沿わせるため 4m より長くはしない
+  const out = [pts[0]];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const a = out.at(-1), b = pts[i], c = pts[i + 1];
+    const a1 = Math.atan2(b[1] - a[1], b[0] - a[0]), a2 = Math.atan2(c[1] - b[1], c[0] - b[0]);
+    let d = Math.abs(a1 - a2); if (d > Math.PI) d = 2 * Math.PI - d;
+    if (d > 0.01 || Math.hypot(c[0] - a[0], c[1] - a[1]) > 4) out.push(b);
+  }
+  out.push(pts.at(-1));
+  return out;
+};
 for (const w of osm.ways) {
   if (w.tunnel) continue;
   // 1m おきに並べ、交差点の近くは使わない
@@ -590,11 +607,12 @@ for (const sgn of osm.signals) {
 console.log('markings', markings.length, 'crosswalks', crosswalks.length, 'signal heads', signals.length, 'intersections', groups.length, 'stop lines', stops.length, 'poles', poles.length / 3);
 
 const meta = {
-  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル)、国土交通省 PLATEAU 金沢市 2024、© OpenStreetMap contributors(ODbL)。加工して作成',
+  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル・シームレス空中写真)、国土交通省 PLATEAU 金沢市 2024、© OpenStreetMap contributors(ODbL)。加工して作成',
   origin: ORIGIN, area: AREA,
   height: { core: core.meta, far: far.meta, scale: 0.01 },
   land: { x0: MASK.x0, z0: MASK.z0, w: MASK.w, h: MASK.h },
   landuse: { x0: MASK.x0, z0: MASK.z0, w: LUW, h: LUH, cell: 2 },
+  photo: fs.existsSync(path.join(RAW, 'photo/bounds.json')) ? JSON.parse(fs.readFileSync(path.join(RAW, 'photo/bounds.json'))) : null,
 };
 fs.writeFileSync(path.join(OUT, 'meta.json'), JSON.stringify(meta, null, 1));
 fs.writeFileSync(path.join(OUT, 'buildings.json'), JSON.stringify(buildings));
@@ -748,10 +766,61 @@ const streetTrees = [];
 }
 
 fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water, curbs, medians, streetTrees }));
+// ---------- ガードレール:住宅地の外で、道路の脇が 1.2m 以上落ち込んでいる所 ----------
+const guards = [];
+for (const w of osm.ways) {
+  if (w.tunnel || w.bridge || w.hw === 'service') continue;
+  for (const side of [-1, 1]) {
+    let run = [];
+    const flush = () => { if (run.length >= 5) guards.push(run.flat().map(r1)); run = []; };
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const [a, b] = [w.pts[i], w.pts[i + 1]];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]); if (L < 0.5) continue;
+      const ux = (b[0] - a[0]) / L, uz = (b[1] - a[1]) / L, lx = uz * side, lz = -ux * side;
+      for (let t = 0; t < L; t += 2) {
+        const x = a[0] + ux * t, z = a[1] + uz * t;
+        const lu = luAt(x, z);
+        const e = w.w / 2 + 0.5;
+        const ex = x + lx * e, ez = z + lz * e;
+        const drop = heightAt(x, z) - Math.min(heightAt(ex + lx * 3, ez + lz * 3), heightAt(ex + lx * 5, ez + lz * 5));
+        const ok = drop > 1.2 && lu !== 6 && lu !== 7 && maskAt(ex, ez) !== 4 && chan(ex, ez, 0) < 100;
+        if (ok) run.push([ex, ez]); else flush();
+      }
+    }
+    flush();
+  }
+}
+console.log('guardrails', guards.length, (guards.reduce((s3, g) => s3 + g.length / 2, 0) * 2 / 1000).toFixed(1), 'km');
+
+// ---------- 速度の標識:制限速度のある道路の入口に。同じ速度・同じ向きの標識が 200m 以内にあれば省く ----------
+const speedSigns = [];
+for (const w of osm.ways) {
+  if (!w.maxspeed || w.tunnel) continue;
+  const place = (pts, dirSign) => {
+    let acc = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [a, b] = [pts[i], pts[i + 1]];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (acc + L < 15) { acc += L; continue; }
+      const t = (15 - acc) / L;
+      const ux = (b[0] - a[0]) / L, uz = (b[1] - a[1]) / L;
+      const x = a[0] + (b[0] - a[0]) * t + uz * (w.w / 2 + 0.9), z = a[1] + (b[1] - a[1]) * t - ux * (w.w / 2 + 0.9);
+      const ang = Math.atan2(uz, ux);
+      if (speedSigns.some((q) => q[3] === w.maxspeed && Math.hypot(q[0] - x, q[1] - z) < 200 && Math.cos(q[2] - ang) > 0.7)) return;
+      if (maskAt(x, z) === 4) return;
+      speedSigns.push([r1(x), r1(z), Math.round(ang * 1000) / 1000, w.maxspeed]);
+      return;
+    }
+  };
+  place(w.pts, 1);
+  if (!w.oneway) place([...w.pts].reverse(), -1);
+}
+console.log('speed signs', speedSigns.length);
+
 const RANK = { trunk: 3, primary: 3, motorway: 3, secondary: 2, tertiary: 2, unclassified: 1, residential: 1, living_street: 1, service: 0 };
 fs.writeFileSync(path.join(OUT, 'lines.json'), JSON.stringify({
   lines: osm.ways.filter((w) => !w.tunnel).map((w) => ({ w: RANK[w.hw.replace('_link', '')] ?? 1, cw: r1(w.w), o: w.oneway ? 1 : 0, n: w.name || w.ref || undefined, v: w.maxspeed || undefined, p: w.pts.flat().map(r1) })),
-  poles, signals,
+  poles, signals, wires, guards, speedSigns,
 }));
 fs.writeFileSync(path.join(OUT, 'places.json'), JSON.stringify({ places, trees }));
 for (const f of fs.readdirSync(OUT)) console.log(f, (fs.statSync(path.join(OUT, f)).size / 1e6).toFixed(2), 'MB');

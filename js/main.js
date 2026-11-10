@@ -16,18 +16,22 @@ const ui = {
 };
 
 // ---------- 描画の土台 ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// 奥行きはふつうの深度(対数深度は重く、reverse Z はこの版では表示が崩れるため)
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+// 画素の細かさは、描画の速さを見ながら自動で上げ下げする(下の adaptResolution)
+const maxRatio = Math.min(devicePixelRatio, 1.5);
+let pixelRatio = Math.min(devicePixelRatio, 1.25);
+renderer.setPixelRatio(pixelRatio);
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.72;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
 $('view').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 14000);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 14000);
 
 // 空と太陽(晴れた日の午後、南西寄りから)
 const sky = new Sky();
@@ -145,6 +149,7 @@ Promise.all([carReady, mapReady]).then(([gltf]) => {
   const sp = world.spawnNear(-560, -100, 3);
   vehicle.reset(sp.x, sp.z, sp.heading);
   instruments = new Instruments(carRoot, world, renderer);
+  applyQuality();
   setProgress(1, '準備ができました');
   ui.start.hidden = false;
   ui.start.focus();
@@ -179,6 +184,31 @@ input.on('reset', () => {
   vehicle.reset(sp.x, sp.z, sp.heading);
   chase.init = false;
 });
+// ---------- 画質:標準 / 軽量 ----------
+let quality = 'normal';
+try { quality = localStorage.getItem('morinodrive.quality') || 'normal'; } catch {}
+function applyQuality() {
+  if (world) world.setQuality(quality);
+  sun.shadow.mapSize.set(quality === 'low' ? 1024 : 2048, quality === 'low' ? 1024 : 2048);
+  if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+  scene.fog.density = quality === 'low' ? 0.00045 : 0.00021;
+  camera.far = quality === 'low' ? 5000 : 14000;
+  const b = ui.pause.querySelector('[data-act="quality"] span');
+  if (b) b.textContent = quality === 'low' ? '軽量' : '標準';
+}
+// 速さに合わせて画素の細かさを変える(1 秒ごとに見直す)
+let frameAcc = 0, frameN = 0;
+function adaptResolution(dt) {
+  frameAcc += dt; frameN++;
+  if (frameAcc < 1) return;
+  const avg = frameAcc / frameN;
+  frameAcc = 0; frameN = 0;
+  let next = pixelRatio;
+  if (avg > 1 / 45) next = Math.max(0.8, pixelRatio - 0.1); // これより下げると白線がにじむ
+  else if (avg < 1 / 58 && pixelRatio < maxRatio) next = Math.min(maxRatio, pixelRatio + 0.05);
+  if (Math.abs(next - pixelRatio) > 0.01) { pixelRatio = next; renderer.setPixelRatio(pixelRatio); }
+}
+
 // ---------- ミニマップ ----------
 let mapOn = false, mapTimer = 0;
 function setMinimap(on) {
@@ -230,6 +260,7 @@ ui.pause.addEventListener('click', (e) => {
   if (a === 'reset') { input._emit('reset'); setPaused(false); }
   if (a === 'help') { ui.help.hidden = false; helpTimer = 999; setPaused(false); }
   if (a === 'map') { setMinimap(!mapOn); setPaused(false); }
+  if (a === 'quality') { quality = quality === 'low' ? 'normal' : 'low'; try { localStorage.setItem('morinodrive.quality', quality); } catch {} applyQuality(); }
 });
 
 // ---------- カメラ ----------
@@ -249,7 +280,7 @@ function updateCamera(dt) {
   lookPitch += (THREE.MathUtils.clamp(tPitch, -0.6, 0.5) - lookPitch) * Math.min(1, dt * 8);
 
   if (camMode === 'cockpit') {
-    camera.fov = 64; camera.near = 0.03;
+    camera.fov = 64; camera.near = 0.05;
     const eye = EYE.clone();
     eye.x -= THREE.MathUtils.clamp(v.longAcc * 0.006, -0.04, 0.04);
     eye.z -= THREE.MathUtils.clamp(v.latAcc * 0.005, -0.04, 0.04);
@@ -311,7 +342,8 @@ function frame() {
     }
     world.updateSignals(performance.now() / 1000);
     world.updateVisibility(camera.position);
-    instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '');
+    instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '', camMode === 'cockpit');
+    world.pumpNavTiles(vehicle.pos.x, vehicle.pos.z);
     drawMinimap(dt);
     updateCamera(dt);
     const fc = window.__drive?.freeCam; // 確認用の上空カメラ
@@ -332,6 +364,7 @@ function frame() {
     camera.lookAt(0, 80, 0);
   }
   renderer.render(scene, camera);
+  if (started) adaptResolution(dt);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -343,4 +376,4 @@ addEventListener('resize', () => {
 });
 
 // 動作確認用(自動テストから車を動かす)
-window.__drive = { get scene() { return scene; }, get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };
+window.__drive = { get scene() { return scene; }, get caps() { return { reverse: renderer.capabilities.reverseDepthBuffer, ratio: pixelRatio }; }, get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };

@@ -36,15 +36,16 @@ export class Instruments {
     this.ready = 0;
   }
 
-  update(dt, v, place) {
+  update(dt, v, place, visible = true) {
     this.t += dt; this.tn += dt;
     this.ready += dt;
     this.power += ((v.drivePower / 1000) - this.power) * Math.min(1, dt * 5);
     // 電池:回生で増え、強い加速で減る(見た目の目安)
     this.battery = THREE.MathUtils.clamp(this.battery - this.power * dt * 0.00008, 0.2, 0.9);
     this.fuel = Math.max(0.05, this.fuel - Math.max(0, this.power - 20) * dt * 0.0000012);
-    if (this.t > 1 / 30) { this.t = 0; this._drawMeter(v); this.mtex.needsUpdate = true; }
-    if (this.tn > 1 / 12) { this.tn = 0; this._drawNav(v, place); this.ntex.needsUpdate = true; }
+    // 運転席から見ていないときは書き換えを減らす(絵を GPU に送る量を抑える)
+    if (this.t > (visible ? 1 / 24 : 0.5)) { this.t = 0; this._drawMeter(v); this.mtex.needsUpdate = true; }
+    if (this.tn > (visible ? 1 / 8 : 1)) { this.tn = 0; this._drawNav(v, place); this.ntex.needsUpdate = true; }
   }
 
   _drawMeter(v) {

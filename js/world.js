@@ -5,6 +5,11 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 async function fetchJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`); return r.json(); }
+async function fetchBitmap(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  return createImageBitmap(await r.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+}
 async function fetchPixels(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
@@ -37,6 +42,8 @@ export class World {
       ['lines', () => fetchJSON(base + 'lines.json')],
       ['places', () => fetchJSON(base + 'places.json')],
       ['luse', () => fetchPixels(base + 'landuse.png')],
+      ['photoCore', () => fetchBitmap(base + 'photo_core.jpg').catch(() => null)],
+      ['photoFar', () => fetchBitmap(base + 'photo_far.jpg').catch(() => null)],
     ];
     const d = {};
     let n = 0;
@@ -50,6 +57,7 @@ export class World {
     this.far = { ...d.meta.height.far, h: decodeHeights(d.far) };
     this.land = { ...d.meta.land, data: d.land.data, bmp: d.land.bmp };
     this.luse = { ...d.meta.landuse, bmp: d.luse.bmp, data: d.luse.data };
+    this.photo = d.meta.photo && d.photoCore ? { box: d.meta.photo, core: d.photoCore, far: d.photoFar } : null;
     this.buildings = d.buildings;
     this.bridges = d.roads.bridges;
     this.markings = d.roads.markings;
@@ -59,6 +67,9 @@ export class World {
     this.lines = d.lines.lines;
     this.poles = d.lines.poles;
     this.signals = d.lines.signals || [];
+    this.wires = d.lines.wires || [];
+    this.guards = d.lines.guards || [];
+    this.speedSigns = d.lines.speedSigns || [];
     this.curbs = d.roads.curbs || [];
     this.medians = d.roads.medians || [];
     this.streetTrees = d.roads.streetTrees || [];
@@ -66,6 +77,8 @@ export class World {
     this.solids = new Map();
     for (let i = 0; i < this.poles.length; i += 3) this._addSolid({ x: this.poles[i], z: this.poles[i + 1], r: 0.22 });
     for (const sg of this.signals) this._addSolid({ x: sg[0], z: sg[1], r: 0.18 });
+    for (const g of this.guards) for (let i = 0; i + 3 < g.length; i += 2) this._addSolid({ x: g[i], z: g[i + 1], bx: g[i + 2], bz: g[i + 3], r: 0.15 });
+    for (const ss of this.speedSigns) this._addSolid({ x: ss[0], z: ss[1], r: 0.1 });
     for (let i = 0; i < this.streetTrees.length; i += 2) this._addSolid({ x: this.streetTrees[i], z: this.streetTrees[i + 1], r: 0.3 });
     for (const m of this.medians) for (let i = 0; i + 3 < m.p.length; i += 2) {
       const w = Math.min(m.w[i / 2], m.w[i / 2 + 1]);
@@ -252,6 +265,9 @@ export class World {
     this._buildTrees(scene);
     this._buildCrossings(scene);
     this._buildCurbs(scene);
+    this._buildWires(scene);
+    this._buildGuards(scene);
+    this._buildSpeedSigns(scene);
     this._buildMedians(scene);
     this._buildSignals(scene);
   }
@@ -265,6 +281,14 @@ export class World {
     m.onBeforeCompile = (sh) => {
       sh.uniforms.landTex = { value: landTex };
       sh.uniforms.luseTex = { value: this._luseTex };
+      const ph = this.photo;
+      const mkTex = (bmp) => { const t = new THREE.Texture(bmp); t.flipY = false; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; t.needsUpdate = true; return t; };
+      sh.uniforms.photoCore = { value: ph ? mkTex(ph.core) : null };
+      sh.uniforms.photoFar = { value: ph && ph.far ? mkTex(ph.far) : null };
+      const bx = (b) => new THREE.Vector4(b.x0, b.z0, b.x1 - b.x0, b.z1 - b.z0);
+      sh.uniforms.photoCoreBox = { value: ph ? bx(ph.box.core) : new THREE.Vector4(0, 0, 1, 1) };
+      sh.uniforms.photoFarBox = { value: ph && ph.far ? bx(ph.box.far) : new THREE.Vector4(0, 0, 1, 1) };
+      sh.uniforms.usePhoto = { value: ph ? 1 : 0 };
       sh.uniforms.luseBox = { value: new THREE.Vector4(this.luse.x0, this.luse.z0, this.luse.w * this.luse.cell, this.luse.h * this.luse.cell) };
       sh.uniforms.landBox = { value: new THREE.Vector4(L.x0, L.z0, L.w, L.h) };
       sh.uniforms.grassTex = { value: grass };
@@ -273,8 +297,9 @@ export class World {
         .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
       sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
 varying vec3 vWPos;
-uniform sampler2D landTex, grassTex, asphaltTex, luseTex;
-uniform vec4 landBox, luseBox;`)
+uniform sampler2D landTex, grassTex, asphaltTex, luseTex, photoCore, photoFar;
+uniform vec4 landBox, luseBox, photoCoreBox, photoFarBox;
+uniform int usePhoto;`)
         .replace('#include <color_fragment>', `#include <color_fragment>
 {
   vec2 luv = (vWPos.xz - landBox.xy) / landBox.zw;
@@ -306,6 +331,19 @@ uniform vec4 landBox, luseBox;`)
     } else if (lu == 8.0) { // 空き地・農業施設:土と砂利
       g = mix(vec3(0.22, 0.19, 0.14), vec3(0.18, 0.18, 0.12), n1) * mix(0.9, 1.1, n2);
     }
+    // 航空写真を下地に:林・畑・田・草地・公園と、土地利用の範囲の外(遠景の山)。住宅地などは屋根が写るので使わない
+    if (usePhoto == 1 && (lu < 6.0 || lu == 8.0)) {
+      vec2 pc = (vWPos.xz - photoCoreBox.xy) / photoCoreBox.zw;
+      vec3 ph;
+      if (pc.x > 0.0 && pc.y > 0.0 && pc.x < 1.0 && pc.y < 1.0) ph = texture2D(photoCore, pc).rgb;
+      else ph = texture2D(photoFar, (vWPos.xz - photoFarBox.xy) / photoFarBox.zw).rgb;
+      // 写真は霞んで青っぽいので少し締め、細かい粒を足す
+      // 写真の林はとても暗く、そのままだと空の光で青く沈むので、明るさを上げて青みを抜く
+      float lum = dot(ph, vec3(0.3, 0.55, 0.15));
+      ph = mix(vec3(lum), ph, 1.35) * vec3(1.0, 1.02, 0.72) * 1.25 * mix(0.88, 1.1, n2);
+      float wPh = lu == 0.0 ? 0.92 : 0.7;
+      g = mix(g, ph, wPh);
+    }
   }
   // アスファルト:細かい骨材の粒(約 0.5m 周期)+ 数 m の色むら + 数十 m の補修跡のような濃淡
   vec4 nA = texture2D(asphaltTex, vWPos.xz * 0.9);
@@ -317,9 +355,12 @@ uniform vec4 landBox, luseBox;`)
   vec3 wat = vec3(0.05, 0.08, 0.08);
   vec3 c = g;
   c = mix(c, lot, smoothstep(0.08, 0.45, land.b));
+  c *= 1.0 - 0.38 * smoothstep(0.55, 0.78, land.b); // 建物の足元の陰
   float wat_t = smoothstep(0.75, 0.95, land.g);
   // 道路の範囲(車道+歩道)をひとまとめにしてから、車道を上に塗る(境目に草が出ないように)
   float area = clamp(land.r + min(land.g, 0.5) * 2.0 * (1.0 - wat_t), 0.0, 1.0);
+  // 境目は画面の 1 画素ぶんだけで切り替える(近くでもぼやけない)
+  float fwA = max(fwidth(area), 0.002), fwR = max(fwidth(land.r), 0.002);
   // 歩道:30cm × 15cm のブロック舗装(遠くでは模様を消して平均色に)
   vec2 bp = vec2(vWPos.x / 0.3 + mod(floor(vWPos.z / 0.15), 2.0) * 0.5, vWPos.z / 0.15);
   vec2 bf = fract(bp);
@@ -328,9 +369,9 @@ uniform vec4 landBox, luseBox;`)
   float tint = fract(sin(dot(floor(bp), vec2(12.9898, 78.233))) * 43758.5453);
   vec3 walkBase = mix(vec3(0.42, 0.41, 0.39), vec3(0.36, 0.33, 0.31), step(0.8, tint));
   vec3 walk = mix(walkBase * mix(1.0, 0.72, joint) * mix(0.94, 1.04, tint), vec3(0.385, 0.375, 0.36), far);
-  c = mix(c, walk, smoothstep(0.25, 0.6, area));
+  c = mix(c, walk, clamp((area - 0.45) / fwA + 0.5, 0.0, 1.0));
   c = mix(c, wat, wat_t);
-  float road = smoothstep(0.38, 0.62, land.r);
+  float road = clamp((land.r - 0.5) / fwR + 0.5, 0.0, 1.0);
   c = mix(c, asp, road);
   diffuseColor.rgb = c;
 }`);
@@ -357,27 +398,48 @@ uniform vec4 landBox, luseBox;`)
       tmp.copy(c1).lerp(c2, Math.min(1, slope * 6)).lerp(c3, smooth(70, 160, y));
       col[k] = tmp.r; col[k + 1] = tmp.g; col[k + 2] = tmp.b;
     }
-    // 512m 四方ほどの塊に分けて、見えない所を描かないようにする
-    const C = Math.max(8, Math.round(512 / (G.spacing * step)));
+    // 256m 四方ほどの塊に分けて、見えない所を描かないようにする。
+    // 遠い塊は 2 マスおき(三角形 1/4)に切り替え、継ぎ目は縁から下へ垂らした「スカート」で隠す
+    const C = Math.max(8, Math.round(256 / (G.spacing * step)));
     const group = new THREE.Group();
+    // スカート用の頂点(各頂点を 4m 下げたもの)を後ろにつなげる
+    const nv = nx * nz;
+    const pos2 = new Float32Array(nv * 6), nor2 = new Float32Array(nv * 6), col2 = new Float32Array(nv * 6);
+    pos2.set(pos); nor2.set(nor); col2.set(col);
+    for (let k = 0; k < nv; k++) { pos2[(nv + k) * 3] = pos[k * 3]; pos2[(nv + k) * 3 + 1] = pos[k * 3 + 1] - 4; pos2[(nv + k) * 3 + 2] = pos[k * 3 + 2]; nor2.set(nor.subarray(k * 3, k * 3 + 3), (nv + k) * 3); col2.set(col.subarray(k * 3, k * 3 + 3), (nv + k) * 3); }
+    const posA = new THREE.BufferAttribute(pos2, 3), norA = new THREE.BufferAttribute(nor2, 3), colA = new THREE.BufferAttribute(col2, 3);
+    this.terrainChunks = this.terrainChunks || [];
     for (let cj = 0; cj < nz - 1; cj += C) for (let ci = 0; ci < nx - 1; ci += C) {
       const w = Math.min(C, nx - 1 - ci), h = Math.min(C, nz - 1 - cj);
-      const idx = [];
-      for (let j = cj; j < cj + h; j++) for (let i = ci; i < ci + w; i++) {
-        const p = j * nx + i;
-        idx.push(p, p + nx, p + 1, p + 1, p + nx, p + nx + 1);
-      }
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-      g.setIndex(idx);
-      g.boundingBox = new THREE.Box3();
-      for (let j = cj; j <= cj + h; j++) for (let i = ci; i <= ci + w; i++) { const k = (j * nx + i) * 3; g.boundingBox.expandByPoint(new THREE.Vector3(pos[k], pos[k + 1], pos[k + 2])); }
-      g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
-      const m = new THREE.Mesh(g, mat);
-      m.receiveShadow = true;
-      group.add(m);
+      const make = (st) => {
+        const idx = [];
+        for (let j = cj; j < cj + h; j += st) for (let i = ci; i < ci + w; i += st) {
+          const j2 = Math.min(j + st, cj + h), i2 = Math.min(i + st, ci + w);
+          const a = j * nx + i, b = j * nx + i2, c = j2 * nx + i, d = j2 * nx + i2;
+          idx.push(a, c, b, b, c, d);
+        }
+        if (st > 1) {
+          // 縁のスカート(上の頂点から 4m 下へ)
+          const edge = [];
+          for (let i = ci; i < ci + w; i += st) edge.push([cj * nx + i, cj * nx + Math.min(i + st, ci + w)]);
+          for (let i = ci; i < ci + w; i += st) edge.push([(cj + h) * nx + Math.min(i + st, ci + w), (cj + h) * nx + i]);
+          for (let j = cj; j < cj + h; j += st) edge.push([Math.min(j + st, cj + h) * nx + ci, j * nx + ci]);
+          for (let j = cj; j < cj + h; j += st) edge.push([j * nx + ci + w, Math.min(j + st, cj + h) * nx + ci + w]);
+          for (const [a, b] of edge) idx.push(a, b, nv + a, b, nv + b, nv + a);
+        }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', posA); g.setAttribute('normal', norA); g.setAttribute('color', colA);
+        g.setIndex(idx);
+        g.boundingBox = new THREE.Box3();
+        for (let j = cj; j <= cj + h; j++) for (let i = ci; i <= ci + w; i++) { const k = (j * nx + i) * 3; g.boundingBox.expandByPoint(new THREE.Vector3(pos[k], pos[k + 1], pos[k + 2])); }
+        g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+        const m = new THREE.Mesh(g, mat);
+        m.receiveShadow = true;
+        return m;
+      };
+      const hi = make(1);
+      group.add(hi);
+      if (!sink) { const lo = make(2); lo.visible = false; group.add(lo); this.terrainChunks.push({ hi, lo }); }
     }
     return group;
   }
@@ -451,8 +513,9 @@ uniform vec4 landBox, luseBox;`)
     };
     const tmp = new THREE.Color();
     let fac = [0, 0];
-    const quad = (G, a, b, c, d, n, col, uv) => { // a b c d:反時計回り
-      for (const [v, t] of [[a, uv[0]], [b, uv[1]], [c, uv[2]], [a, uv[0]], [c, uv[2]], [d, uv[3]]]) { G.p.push(...v); G.n.push(...n); G.c.push(col.r, col.g, col.b); G.uv.push(...t); G.f.push(...fac); }
+    const quad = (G, a, b, c, d, n, col, uv, colLow) => { // a b c d:反時計回り(a と d が下)。colLow があれば下の頂点の色
+      const lo = colLow || col;
+      for (const [v, t, cc] of [[a, uv[0], lo], [b, uv[1], col], [c, uv[2], col], [a, uv[0], lo], [c, uv[2], col], [d, uv[3], lo]]) { G.p.push(...v); G.n.push(...n); G.c.push(cc.r, cc.g, cc.b); G.uv.push(...t); G.f.push(...fac); }
     };
     const triangle = (G, a, b, c, n, col, uv) => { for (const [v, t] of [[a, uv[0]], [b, uv[1]], [c, uv[2]]]) { G.p.push(...v); G.n.push(...n); G.c.push(col.r, col.g, col.b); G.uv.push(...t); G.f.push(...fac); } };
     const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
@@ -466,6 +529,7 @@ uniform vec4 landBox, luseBox;`)
       fac = [st[0] < 0 ? houseTile : st[0], st[1] < 0 ? houseTile : st[1]];
       const G = ch.wall;
       const wallCol = tmp.set(pick(st[4])).clone().multiplyScalar(0.93 + rnd() * 0.1);
+      const wallLow = wallCol.clone().multiplyScalar(Math.max(0.62, 1 - 1.6 / Math.max(3, b.h)));
       const g0 = (b.gb ?? b.g) - 0.4; // 低い側は基礎の壁で地面まで
       let top = b.g + b.h, eave = top;
       let rise = 0;
@@ -484,7 +548,8 @@ uniform vec4 landBox, luseBox;`)
         const u0 = run / texW, u1 = (run + L) / texW; run += L;
         const v0 = 0, v1 = (eave - b.g) / floorH;
         // 外向きの面になる順(下a 上a 上b 下b を外から見て反時計回り)
-        quad(G, [ax, fl, az], [ax, eave, az], [bx, eave, bz], [bx, fl, bz], nn, wallCol, [[u0, v0], [u0, v1], [u1, v1], [u1, v0]]);
+        // 足元は地面からの照り返しが少なく暗い(壁の高さで薄める)
+        quad(G, [ax, fl, az], [ax, eave, az], [bx, eave, bz], [bx, fl, bz], nn, wallCol, [[u0, v0], [u0, v1], [u1, v1], [u1, v0]], wallLow);
         if (fl - g0 > 0.05) quad(ch.roof, [ax, g0, az], [ax, fl, az], [bx, fl, bz], [bx, g0, bz], nn, baseCol, [[0, 0], [0, 0], [0, 0], [0, 0]]);
       }
       const roofCol = tmp.set(pick(st[6])).clone().multiplyScalar(0.9 + rnd() * 0.2);
@@ -506,9 +571,6 @@ uniform vec4 landBox, luseBox;`)
           triangle(G, a, m, c, nrm, wallCol, [[0, (eave - b.g) / floorH], [W / 2 / texW, (top - b.g) / floorH], [W / texW, (eave - b.g) / floorH]]);
           fac = fac0;
         }
-        // 屋根の下のふた
-        const contour = []; for (let i = 0; i < n; i++) contour.push(new THREE.Vector2(p[i * 2], p[i * 2 + 1]));
-        for (const t of THREE.ShapeUtils.triangulateShape(contour, [])) triangle(ch.roof, [p[t[0] * 2], eave - 0.05, p[t[0] * 2 + 1]], [p[t[2] * 2], eave - 0.05, p[t[2] * 2 + 1]], [p[t[1] * 2], eave - 0.05, p[t[1] * 2 + 1]], [0, 1, 0], roofCol, [[0, 0], [0, 0], [0, 0]]);
       } else {
         const flat = tmp.set(0x8f8e8a).clone().multiplyScalar(0.85 + rnd() * 0.25);
         const contour = []; for (let i = 0; i < n; i++) contour.push(new THREE.Vector2(p[i * 2], p[i * 2 + 1]));
@@ -657,7 +719,7 @@ uniform vec4 landBox, luseBox;`)
 
   _buildMarkings(scene) {
     const P = [], C = [];
-    const white = new THREE.Color(0xe9e9e4), yellow = new THREE.Color(0xe0a92a);
+    const white = new THREE.Color(0xf4f4f0), yellow = new THREE.Color(0xeaae2a);
     const W = 0.15;
     for (const mk of this.markings) {
       const col = mk.s === 'yellow' ? yellow : white;
@@ -679,14 +741,14 @@ uniform vec4 landBox, luseBox;`)
     g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
     g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(P.length).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
-    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, vertexColors: true, roughness: 0.7, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, vertexColors: true, roughness: 0.55, emissive: 0x202020, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
     m.receiveShadow = true;
     scene.add(m);
   }
 
   _buildPoles(scene) {
     const n = this.poles.length / 3;
-    const pole = new THREE.CylinderGeometry(0.13, 0.19, 11, 8).translate(0, 5.5, 0);
+    const pole = new THREE.CylinderGeometry(0.13, 0.19, 11, 6, 1, true).translate(0, 5.5, 0);
     const arm = new THREE.BoxGeometry(0.1, 0.1, 1.6).translate(0, 10.1, 0);
     const poles = new THREE.InstancedMesh(pole, new THREE.MeshStandardMaterial({ color: 0x9b9890, roughness: 0.85 }), n);
     const arms = new THREE.InstancedMesh(arm, new THREE.MeshStandardMaterial({ color: 0x55534d, roughness: 0.6, metalness: 0.3 }), n);
@@ -717,11 +779,18 @@ uniform vec4 landBox, luseBox;`)
       // 3 低木
       withColor(prep(new THREE.IcosahedronGeometry(0.75, 0).scale(1.2, 0.7, 1.0).translate(0, 0.45, 0)), crownC),
     ];
+    // 遠くで使う簡単な形(三角形を 5〜8 枚)
+    const LOW = [
+      withColor(prep(new THREE.ConeGeometry(2.1, 10, 5, 1, true).translate(0, 7, 0)), crownC),
+      withColor(prep(new THREE.OctahedronGeometry(3.0, 0).scale(1, 0.95, 1).translate(0, 5.4, 0)), crownC),
+      withColor(prep(new THREE.OctahedronGeometry(1.3, 0).translate(0, 2.4, 0)), crownC),
+      null, // 低木は遠くでは描かない
+    ];
     const HUE = [[0.31, 0.38, 0.085, 0.03], [0.24, 0.42, 0.12, 0.05], [0.28, 0.40, 0.11, 0.04], [0.29, 0.45, 0.10, 0.04]]; // [色相, 彩度, 明るさ, ばらつき]
     const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, flatShading: true });
     const chunks = new Map();
     for (let i = 0; i < n; i++) {
-      const k = `${Math.floor(t[i * 4] / 512)},${Math.floor(t[i * 4 + 1] / 512)},${t[i * 4 + 3]}`;
+      const k = `${Math.floor(t[i * 4] / 256)},${Math.floor(t[i * 4 + 1] / 256)},${t[i * 4 + 3]}`;
       if (!chunks.has(k)) chunks.set(k, []);
       chunks.get(k).push(i);
     }
@@ -740,19 +809,40 @@ uniform vec4 landBox, luseBox;`)
         im.setColorAt(j, col.setHSL(hh + ((s % 7) / 7 - 0.5) * vv, ss, ll + ((s % 11) / 11 - 0.5) * vv));
       });
       im.computeBoundingSphere();
-      im.castShadow = true;
+      im.castShadow = false; // 林の木の影は重いので落とさない(街路樹は落とす)
       im.receiveShadow = true;
       scene.add(im);
-      this.treeChunks.push(im);
+      let lo = null;
+      if (LOW[type]) {
+        lo = new THREE.InstancedMesh(LOW[type], mat, list.length);
+        for (let j = 0; j < list.length; j++) { im.getMatrixAt(j, M); lo.setMatrixAt(j, M); im.getColorAt(j, col); lo.setColorAt(j, col); }
+        lo.computeBoundingSphere();
+        lo.visible = false;
+        scene.add(lo);
+      }
+      this.treeChunks.push({ hi: im, lo, type });
     }
   }
   // 遠くの木の塊は描かない(霧で見えない距離)
+  // 塊の中心からの距離で、近い形・遠い形・描かないを切り替える(画質の設定で距離が変わる)
   updateVisibility(cam) {
-    if (!this.treeChunks) return;
-    for (const im of this.treeChunks) {
-      const s = im.boundingSphere;
-      im.visible = !s || s.center.distanceTo(cam) - s.radius < 1100;
+    for (const c of this.terrainChunks || []) {
+      const sp = c.hi.geometry.boundingSphere;
+      const far = sp.center.distanceTo(cam) - sp.radius > 450;
+      c.hi.visible = !far; c.lo.visible = far;
     }
+    if (!this.treeChunks) return;
+    const q = this.quality || { near: 260, far: 1100 };
+    for (const c of this.treeChunks) {
+      const s = c.hi.boundingSphere;
+      const d = s ? Math.max(0, s.center.distanceTo(cam) - s.radius) : 0;
+      // 塊は 256m 四方。近い形は塊の端までの距離で決める
+      c.hi.visible = d < q.near;
+      if (c.lo) c.lo.visible = d >= q.near && d < q.far;
+    }
+  }
+  setQuality(level) {
+    this.quality = level === 'low' ? { near: 120, far: 650 } : { near: 260, far: 1100 };
   }
 
 
@@ -780,9 +870,113 @@ uniform vec4 landBox, luseBox;`)
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(P.length).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
-    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0xe6e6e1, roughness: 0.7, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0xf2f2ee, roughness: 0.55, emissive: 0x202020, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
     m.receiveShadow = true;
     scene.add(m);
+  }
+
+  // ---------- 電線:腕木の両端と下の通信線の 3 本。たるみをつけて結ぶ ----------
+  _buildWires(scene) {
+    const P = [];
+    const end = (i) => {
+      const x = this.poles[i * 3], z = this.poles[i * 3 + 1], a = this.poles[i * 3 + 2] / 255 * Math.PI * 2 - Math.PI;
+      const g = this.terrainHeight(x, z) - 0.3;
+      // 腕木は道路と直角(電柱の向きに対して z 方向)
+      const ax = -Math.sin(a), az = Math.cos(a);
+      return [[x + ax * 0.7, g + 10.15, z + az * 0.7], [x - ax * 0.7, g + 10.15, z - az * 0.7], [x, g + 8.3, z]];
+    };
+    for (let k = 0; k < this.wires.length; k += 2) {
+      const A = end(this.wires[k]), B = end(this.wires[k + 1]);
+      const L = Math.hypot(A[2][0] - B[2][0], A[2][2] - B[2][2]);
+      const sag = 0.25 + 0.5 * (L / 40) ** 2;
+      for (let w = 0; w < 3; w++) {
+        const a = A[w], b = B[w];
+        // 向かい合う腕木の端を入れ違えないよう、近い方どうしを結ぶ
+        const bb = w < 2 && Math.hypot(a[0] - B[1 - w][0], a[2] - B[1 - w][2]) < Math.hypot(a[0] - b[0], a[2] - b[2]) ? B[1 - w] : b;
+        let prev = a;
+        for (let s2 = 1; s2 <= 8; s2++) {
+          const t = s2 / 8;
+          const q = [a[0] + (bb[0] - a[0]) * t, a[1] + (bb[1] - a[1]) * t - sag * 4 * t * (1 - t), a[2] + (bb[2] - a[2]) * t];
+          P.push(...prev, ...q); prev = q;
+        }
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+    scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x26292c })));
+  }
+
+  // ---------- ガードレール(白い波形の板と支柱) ----------
+  _buildGuards(scene) {
+    const P = [], N = [];
+    const push = (v, n) => { P.push(...v); N.push(...n); };
+    const posts = [];
+    for (const gd of this.guards) {
+      let acc = 0;
+      for (let i = 0; i + 3 < gd.length; i += 2) {
+        const ax = gd[i], az = gd[i + 1], bx = gd[i + 2], bz = gd[i + 3];
+        const L = Math.hypot(bx - ax, bz - az); if (L < 0.05) continue;
+        const ha = this.terrainHeight(ax, az), hb = this.terrainHeight(bx, bz);
+        const n = [-(bz - az) / L, 0, (bx - ax) / L];
+        for (const [y0, y1] of [[0.55, 0.7], [0.72, 0.87]]) {
+          const A0 = [ax, ha + y0, az], A1 = [ax, ha + y1, az], B0 = [bx, hb + y0, bz], B1 = [bx, hb + y1, bz];
+          for (const v of [A0, B0, B1, A0, B1, A1]) push(v, n);
+        }
+        acc += L;
+        if (acc >= 4) { posts.push(ax, ha, az); acc = 0; }
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+    const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0xe9eae6, roughness: 0.45, metalness: 0.3, side: THREE.DoubleSide }));
+    m.castShadow = true;
+    scene.add(m);
+    const pg = new THREE.CylinderGeometry(0.07, 0.07, 1.0, 6, 1, true).translate(0, 0.45, 0);
+    const im = new THREE.InstancedMesh(pg, m.material, posts.length / 3);
+    const M = new THREE.Matrix4();
+    for (let i = 0; i < posts.length / 3; i++) { M.makeTranslation(posts[i * 3], posts[i * 3 + 1], posts[i * 3 + 2]); im.setMatrixAt(i, M); }
+    scene.add(im);
+  }
+
+  // ---------- 速度の標識(赤い輪・白地・青い数字) ----------
+  _buildSpeedSigns(scene) {
+    if (!this.speedSigns.length) return;
+    const speeds = [...new Set(this.speedSigns.map((q) => q[3]))];
+    const C = document.createElement('canvas'); C.width = 128 * speeds.length; C.height = 128;
+    const g = C.getContext('2d');
+    speeds.forEach((v, i) => {
+      const cx = i * 128 + 64;
+      g.fillStyle = '#d42b26'; g.beginPath(); g.arc(cx, 64, 62, 0, 7); g.fill();
+      g.fillStyle = '#ffffff'; g.beginPath(); g.arc(cx, 64, 48, 0, 7); g.fill();
+      g.fillStyle = '#1d4e98'; g.font = '700 46px "Barlow Semi Condensed", sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(String(v), cx, 67);
+    });
+    const tex = new THREE.CanvasTexture(C); tex.colorSpace = THREE.SRGBColorSpace;
+    const P = [], UV = [], N = [];
+    const metal = new THREE.MeshStandardMaterial({ color: 0x9a9da0, roughness: 0.5, metalness: 0.4 });
+    const poleG = new THREE.CylinderGeometry(0.04, 0.04, 2.6, 6, 1, true).translate(0, 1.3, 0);
+    const poles = new THREE.InstancedMesh(poleG, metal, this.speedSigns.length);
+    const M = new THREE.Matrix4();
+    this.speedSigns.forEach(([x, z, ang, v], i) => {
+      const gy = this.terrainHeight(x, z);
+      M.makeTranslation(x, gy, z); poles.setMatrixAt(i, M);
+      // 板は進んでくる車の方(-進行方向)を向く。円を 16 角形で
+      const fx = Math.cos(ang), fz = Math.sin(ang), rx = -fz, rz = fx; // 板の横方向
+      const k = speeds.indexOf(v), cy = gy + 2.35, R = 0.3;
+      const cxp = x - fx * 0.05, czp = z - fz * 0.05;
+      for (let s2 = 0; s2 < 16; s2++) {
+        const t0 = s2 / 16 * Math.PI * 2, t1 = (s2 + 1) / 16 * Math.PI * 2;
+        const pt = (t) => [cxp + rx * Math.cos(t) * R, cy + Math.sin(t) * R, czp + rz * Math.cos(t) * R];
+        const uv = (t) => [(k * 128 + 64 - Math.cos(t) * 62) / C.width, 0.5 + Math.sin(t) * 62 / 128];
+        for (const [v3, u2] of [[[cxp, cy, czp], [(k * 128 + 64) / C.width, 0.5]], [pt(t0), uv(t0)], [pt(t1), uv(t1)]]) { P.push(...v3); UV.push(...u2); N.push(-fx, 0, -fz); }
+      }
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+    scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ map: tex, roughness: 0.5, side: THREE.DoubleSide, emissive: 0xffffff, emissiveMap: tex, emissiveIntensity: 0.15 })), poles);
   }
 
   // ---------- 縁石(高さ 15cm、幅 18cm) ----------
@@ -932,40 +1126,53 @@ uniform vec4 landBox, luseBox;`)
     this.lamps.instanceColor.needsUpdate = true;
   }
 
-  // ---------- カーナビの地図(256m 四方のタイルを描いてためておく) ----------
+  // ---------- カーナビ・ミニマップの地図(256m 四方のタイル) ----------
+  // 1 枚 1〜2ms で作れるよう 1m = 1 画素で色を決め、描くときになめらかに拡大する。
+  // 1 フレームに作るのは 1 枚まで(まとめて作ると一瞬止まるため)。まだ無いタイルは後回し。
   navTile(tx, tz) {
     const key = `${tx},${tz}`;
-    if (this.navTiles.has(key)) return this.navTiles.get(key);
-    const S = 2, N = 256 * S;
+    const t = this.navTiles.get(key);
+    if (t) return t;
+    if (!this.navQueue) this.navQueue = new Set();
+    this.navQueue.add(key);
+    return null;
+  }
+  _makeNavTile(tx, tz) {
+    const N = 256;
     const c = document.createElement('canvas'); c.width = c.height = N;
     const g = c.getContext('2d');
     const img = g.createImageData(N, N);
-    const L = this.land;
-    const sample = (x, z, ch) => {
-      const fx = x - L.x0 - 0.5, fz = z - L.z0 - 0.5;
-      const i = Math.floor(fx), j = Math.floor(fz), u = fx - i, v = fz - j;
-      const at = (a, b) => (a < 0 || b < 0 || a >= L.w || b >= L.h) ? 0 : L.data[(b * L.w + a) * 4 + ch];
-      return (at(i, j) * (1 - u) + at(i + 1, j) * u) * (1 - v) + (at(i, j + 1) * (1 - u) + at(i + 1, j + 1) * u) * v;
-    };
-    for (let py = 0; py < N; py++) for (let px = 0; px < N; px++) {
-      const x = tx * 256 + (px + 0.5) / S, z = tz * 256 + (py + 0.5) / S;
-      let r = 236, gg = 238, b = 228;
-      const bl = sample(x, z, 2), wa = sample(x, z, 1), ro = sample(x, z, 0);
-      const blt = smooth(225, 250, bl);
-      r += (214 - r) * blt; gg += (206 - gg) * blt; b += (190 - b) * blt;
-      const sw = smooth(90, 115, wa) * (1 - smooth(180, 230, wa));
-      r += (244 - r) * sw; gg += (243 - gg) * sw; b += (236 - b) * sw;
-      const wt = smooth(190, 240, wa);
-      r += (164 - r) * wt; gg += (196 - gg) * wt; b += (222 - b) * wt;
-      const rt = smooth(100, 160, ro);
-      r += (252 - r) * rt; gg += (251 - gg) * rt; b += (246 - b) * rt;
-      const k = (py * N + px) * 4;
-      img.data[k] = r; img.data[k + 1] = gg; img.data[k + 2] = b; img.data[k + 3] = 255;
+    const L = this.land, D = L.data, out = img.data;
+    for (let py = 0; py < N; py++) {
+      const j = tz * 256 + py - L.z0;
+      for (let px = 0; px < N; px++) {
+        const i = tx * 256 + px - L.x0, k = (py * N + px) * 4;
+        let r = 236, gg = 238, b = 228;
+        if (i >= 0 && j >= 0 && i < L.w && j < L.h) {
+          const q = (j * L.w + i) * 4, ro = D[q], wa = D[q + 1], bl = D[q + 2];
+          if (ro > 127) { r = 252; gg = 251; b = 246; }
+          else if (wa > 200) { r = 164; gg = 196; b = 222; }
+          else if (wa > 90) { r = 244; gg = 243; b = 236; }
+          else if (bl > 240) { r = 214; gg = 206; b = 190; }
+        }
+        out[k] = r; out[k + 1] = gg; out[k + 2] = b; out[k + 3] = 255;
+      }
     }
     g.putImageData(img, 0, 0);
-    if (this.navTiles.size > 60) this.navTiles.delete(this.navTiles.keys().next().value);
-    this.navTiles.set(key, c);
-    return c;
+    if (this.navTiles.size > 80) this.navTiles.delete(this.navTiles.keys().next().value);
+    this.navTiles.set(`${tx},${tz}`, c);
+  }
+  // 毎フレーム呼ぶ:頼まれたタイルか、車のまわりのタイルを 1 枚だけ作る
+  pumpNavTiles(cx, cz) {
+    let key = null;
+    if (this.navQueue && this.navQueue.size) { key = this.navQueue.values().next().value; this.navQueue.delete(key); }
+    else {
+      const tx0 = Math.floor(cx / 256), tz0 = Math.floor(cz / 256);
+      for (let r = 0; r <= 2 && !key; r++) for (let a = -r; a <= r && !key; a++) for (let b = -r; b <= r && !key; b++) {
+        const k = `${tx0 + a},${tz0 + b}`; if (!this.navTiles.has(k)) key = k;
+      }
+    }
+    if (key && !this.navTiles.has(key)) { const [tx, tz] = key.split(',').map(Number); this._makeNavTile(tx, tz); }
   }
   drawNav(g, cx, cz, heading, pxPerM, W, H, ox, oy) {
     g.save();
@@ -974,7 +1181,8 @@ uniform vec4 landBox, luseBox;`)
     const R = Math.hypot(W, H) / pxPerM;
     g.imageSmoothingEnabled = true;
     for (let tz = Math.floor((cz - R) / 256); tz <= Math.floor((cz + R) / 256); tz++) for (let tx = Math.floor((cx - R) / 256); tx <= Math.floor((cx + R) / 256); tx++) {
-      g.drawImage(this.navTile(tx, tz), (tx * 256 - cx) * pxPerM, (tz * 256 - cz) * pxPerM, 256 * pxPerM + 0.5, 256 * pxPerM + 0.5);
+      const tile = this.navTile(tx, tz);
+      if (tile) g.drawImage(tile, (tx * 256 - cx) * pxPerM, (tz * 256 - cz) * pxPerM, 256 * pxPerM + 0.5, 256 * pxPerM + 0.5);
     }
     g.restore();
   }
