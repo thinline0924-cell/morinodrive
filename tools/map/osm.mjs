@@ -47,7 +47,22 @@ export function parseOSM(json) {
     if (hwTag === 'traffic_signals') signals.push({ id, xz: toLocal(n.lat, n.lon) });
     else if (hwTag === 'crossing' || n.tags?.crossing) crossings.push({ id, xz: toLocal(n.lat, n.lon), kind: n.tags.crossing || '' });
   }
-  return { ways, junction, signals, crossings, nodes };
+  // 店や施設(名前のあるもの)。建物の種類と看板に使う
+  const pois = [];
+  for (const e of json.elements) {
+    const t = e.tags;
+    if (!t || !t.name || !(t.amenity || t.shop)) continue;
+    let lat, lon;
+    if (e.type === 'node') { lat = e.lat; lon = e.lon; }
+    else if (e.type === 'way') {
+      const ns = (e.nodes || []).map((id) => nodes.get(id)).filter(Boolean);
+      if (!ns.length) continue;
+      lat = ns.reduce((s, n) => s + n.lat, 0) / ns.length; lon = ns.reduce((s, n) => s + n.lon, 0) / ns.length;
+    } else continue;
+    const [x, z] = toLocal(lat, lon);
+    pois.push({ x, z, name: t.name, amenity: t.amenity || '', shop: t.shop || '', religion: t.religion || '' });
+  }
+  return { ways, junction, signals, crossings, nodes, pois };
 }
 
 // ノード位置での道路の向き(そのノードを通る最初の車道)

@@ -12,6 +12,7 @@ const ui = {
   loader: $('loader'), bar: $('load-bar'), status: $('load-status'), start: $('start'),
   plate: $('plate'), plateName: $('plate-name'), plateRoman: $('plate-roman'),
   help: $('help'), speed: $('speed'), speedNum: $('speed-num'), pause: $('pause'),
+  minimap: $('minimap'), minimapCanvas: $('minimap-canvas'), minimapPlace: $('minimap-place'),
 };
 
 // ---------- 描画の土台 ----------
@@ -55,7 +56,7 @@ sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 const sc = sun.shadow.camera;
 sc.left = -45; sc.right = 45; sc.top = 45; sc.bottom = -45; sc.near = 1; sc.far = 400;
-sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03;
+sun.shadow.bias = -0.0006; sun.shadow.normalBias = 0.08;
 scene.add(sun, sun.target);
 
 // ---------- 土地(実際の地図) ----------
@@ -114,7 +115,9 @@ async function fetchCar(url, approxBytes) {
 const mapReady = World.load('assets/map/', (p) => { prog.map = p; showLoad(); }).then((w) => {
   world = w;
   setProgress(0.97, '街を組み立てています');
-  return new Promise((ok) => setTimeout(() => { world.build(scene, renderer); ok(); }, 30));
+  // 看板の文字を描く前に字体の読み込みを待つ(待ちすぎない)
+  const fonts = Promise.race([document.fonts.load('700 36px "BIZ UDPGothic"'), new Promise((r) => setTimeout(r, 3000))]).catch(() => {});
+  return fonts.then(() => new Promise((ok) => setTimeout(() => { world.build(scene, renderer); ok(); }, 30)));
 });
 const carReady = fetchCar('assets/car.b64.txt', 4363048).then((buf) => new Promise((ok, ng) => loader.parse(buf, '', ok, ng)));
 Promise.all([carReady, mapReady]).then(([gltf]) => {
@@ -157,6 +160,7 @@ ui.start.addEventListener('click', () => {
   currentPlace = null;
   ui.help.hidden = false;
   helpTimer = 14;
+  setMinimap(true);
   renderer.domElement.focus();
 });
 
@@ -175,6 +179,42 @@ input.on('reset', () => {
   vehicle.reset(sp.x, sp.z, sp.heading);
   chase.init = false;
 });
+// ---------- ミニマップ ----------
+let mapOn = false, mapTimer = 0;
+function setMinimap(on) {
+  mapOn = on;
+  ui.minimap.hidden = !on;
+  ui.help.classList.toggle('with-map', on);
+}
+input.on('map', () => { if (started) setMinimap(!mapOn); });
+function drawMinimap(dt) {
+  mapTimer -= dt;
+  if (!mapOn || mapTimer > 0) return;
+  mapTimer = 1 / 15;
+  const c = ui.minimapCanvas, g = c.getContext('2d');
+  const W = c.width, H = c.height;
+  const f = new THREE.Vector3(1, 0, 0).applyQuaternion(vehicle.quat);
+  const heading = Math.atan2(f.z, f.x);
+  g.fillStyle = '#eceee4'; g.fillRect(0, 0, W, H);
+  const px = 1.6; // 1m = 1.6px(画面上で約 280m 四方)
+  const cx = W / 2, cy = H * 0.6;
+  world.drawNav(g, vehicle.pos.x, vehicle.pos.z, heading, px, W, H, cx, cy);
+  // 自車
+  g.save(); g.translate(cx, cy);
+  g.fillStyle = '#c8352b'; g.strokeStyle = '#fff'; g.lineWidth = 3;
+  g.beginPath(); g.moveTo(0, -15); g.lineTo(10, 11); g.lineTo(0, 5); g.lineTo(-10, 11); g.closePath(); g.fill(); g.stroke();
+  g.restore();
+  // 北
+  g.save(); g.translate(W - 30, 34); g.rotate(-heading - Math.PI / 2);
+  g.fillStyle = '#c8352b'; g.beginPath(); g.moveTo(0, -18); g.lineTo(7, 0); g.lineTo(-7, 0); g.closePath(); g.fill();
+  g.fillStyle = '#5f676d'; g.beginPath(); g.moveTo(0, 18); g.lineTo(7, 0); g.lineTo(-7, 0); g.closePath(); g.fill();
+  g.restore();
+  g.fillStyle = '#1e252b'; g.font = '700 18px "BIZ UDPGothic", sans-serif'; g.textAlign = 'center'; g.fillText('N', W - 30, 72);
+  // 縮尺
+  g.fillStyle = '#1e252b'; g.fillRect(16, H - 18, 100 * px, 3); g.fillRect(16, H - 24, 2, 9); g.fillRect(16 + 100 * px - 2, H - 24, 2, 9);
+  g.font = '500 16px "Barlow Semi Condensed", sans-serif'; g.textAlign = 'left'; g.fillText('100 m', 16, H - 30);
+}
+
 input.on('help', () => { if (started) { ui.help.hidden = !ui.help.hidden; helpTimer = ui.help.hidden ? 0 : 999; } });
 input.on('pause', () => { if (started) setPaused(!paused); });
 function setPaused(p) {
@@ -189,6 +229,7 @@ ui.pause.addEventListener('click', (e) => {
   if (a === 'camera') { camMode = camMode === 'chase' ? 'cockpit' : 'chase'; setPaused(false); }
   if (a === 'reset') { input._emit('reset'); setPaused(false); }
   if (a === 'help') { ui.help.hidden = false; helpTimer = 999; setPaused(false); }
+  if (a === 'map') { setMinimap(!mapOn); setPaused(false); }
 });
 
 // ---------- カメラ ----------
@@ -261,13 +302,17 @@ function frame() {
     if (placeTimer <= 0) {
       placeTimer = 0.5;
       const pl = world.placeAt(vehicle.pos.x, vehicle.pos.z);
+      const rd = world.nearestRoad(vehicle.pos.x, vehicle.pos.z, 0);
+      ui.minimapPlace.textContent = [pl?.n, rd && rd.d < 10 ? rd.name : ''].filter(Boolean).join('  ');
       if (pl && pl !== currentPlace) {
         currentPlace = pl;
         if (started) showPlate(pl.n, pl.r);
       }
     }
     world.updateSignals(performance.now() / 1000);
+    world.updateVisibility(camera.position);
     instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '');
+    drawMinimap(dt);
     updateCamera(dt);
     const fc = window.__drive?.freeCam; // 確認用の上空カメラ
     if (fc) { camera.position.set(...fc.pos); camera.lookAt(...fc.look); camera.updateProjectionMatrix(); }
@@ -298,4 +343,4 @@ addEventListener('resize', () => {
 });
 
 // 動作確認用(自動テストから車を動かす)
-window.__drive = { get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };
+window.__drive = { get scene() { return scene; }, get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };

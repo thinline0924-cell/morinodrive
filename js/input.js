@@ -14,7 +14,7 @@ export class Input {
       if (e.repeat) return;
       this.keys.add(e.code);
       this.usingPad = false;
-      const map = { KeyC: 'camera', KeyV: 'camera', KeyR: 'reset', Backspace: 'reset', KeyH: 'help', Escape: 'pause' };
+      const map = { KeyC: 'camera', KeyV: 'camera', KeyR: 'reset', Backspace: 'reset', KeyH: 'help', Escape: 'pause', KeyM: 'map' };
       if (map[e.code]) this._emit(map[e.code]);
     });
     addEventListener('keyup', (e) => this.keys.delete(e.code));
@@ -64,7 +64,7 @@ export class Input {
         if (now && !this.prevButtons[i]) this._emit(name);
         this.prevButtons[i] = now;
       };
-      edge(3, 'camera'); edge(8, 'reset'); edge(9, 'pause'); edge(2, 'help');
+      edge(3, 'camera'); edge(8, 'reset'); edge(9, 'pause'); edge(2, 'help'); edge(12, 'map');
       break;
     }
     return { accel, brake, steer, handbrake, analog };

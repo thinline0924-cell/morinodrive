@@ -56,7 +56,7 @@ export class Vehicle {
     // 建物とぶつかる点(バンパーと側面の高さ)
     this.bumpers = [];
     for (const x of [-2.1, -1.1, 0, 1.1, 2.15]) for (const z of [-0.84, 0.84]) this.bumpers.push(new THREE.Vector3(x, 0.55, z));
-    this.bumpers.push(new THREE.Vector3(2.18, 0.55, 0), new THREE.Vector3(-2.12, 0.55, 0));
+    for (const z of [-0.42, 0, 0.42]) this.bumpers.push(new THREE.Vector3(2.18, 0.55, z), new THREE.Vector3(-2.12, 0.55, z));
     this.steerInput = 0;
     this.steerAngle = 0;
     this.gear = 'P';
@@ -138,6 +138,30 @@ export class Vehicle {
     this.steerInput += THREE.MathUtils.clamp(target - this.steerInput, -rate * dt, rate * dt);
     const lock = SPEC.steerLock / (1 + speed / 10);
     this.steerAngle = this.steerInput * lock;
+    // 横すべり角(車の向きと進む向きのずれ)。右へすべると正
+    const vLat = this.vel.dot(right);
+    const beta = speed > 3 ? Math.atan2(vLat, Math.abs(vLong)) : 0;
+    this.beta = beta;
+    // キーボードで手を離しているときは、すべった向きへ前輪を向ける(カウンターステアの手助け)
+    if (!input.analog && Math.abs(input.steer) < 0.1 && Math.abs(beta) > 0.05 && vLong > 3) {
+      const want = THREE.MathUtils.clamp(beta * 0.9, -SPEC.steerLock * 0.6, SPEC.steerLock * 0.6);
+      this.steerAngle = want; this.steerInput = want / lock;
+    }
+    // 横すべり防止(VSA 相当):向きの変わる速さが、ハンドルとタイヤの限界から見込める値を超えたら戻す
+    const yawRate = this.angVel.dot(up);
+    const L = SPEC.wheelbase;
+    let yawRef = -vLong * Math.tan(this.steerAngle) / L;
+    const yawMax = 0.9 * 9.81 / Math.max(speed, 3);
+    yawRef = THREE.MathUtils.clamp(yawRef, -yawMax, yawMax);
+    const yawErr = yawRate - yawRef;
+    this.vsa = 0;
+    let vsaTorque = 0;
+    if (speed > 5 && (Math.abs(yawErr) > 0.08 || Math.abs(beta) > 0.07)) {
+      // 1 輪ずつブレーキをかけて車の向きを戻す動きを、向きを戻す力と減速で表す
+      const Iyaw = SPEC.mass / 12 * (4.3 ** 2 + 1.7 ** 2) * 0.8;
+      vsaTorque = THREE.MathUtils.clamp(-yawErr * 5.5 * Iyaw, -9000, 9000);
+      this.vsa = Math.min(1, (Math.abs(yawErr) - 0.08) / 0.3 + Math.max(0, Math.abs(beta) - 0.07) * 4);
+    }
 
     // ---------- 駆動力(前輪駆動) ----------
     const dir = this.gear === 'R' ? -1 : 1;
@@ -151,12 +175,19 @@ export class Vehicle {
       if (throttle < 0.05 && brake < 0.05) f += THREE.MathUtils.clamp((1.8 - speed) * 450, 0, 650);
       // アクセルを離したときの回生(軽いエンジンブレーキの感覚)
       if (throttle < 0.05 && speed > 2 && vLong * dir > 0) f -= 0.045 * SPEC.mass * 9.81 * THREE.MathUtils.clamp((speed - 2) / 6, 0, 1);
+      // 横すべり防止が働いている間は駆動を絞る
+      if (this.vsa > 0 && f > 0) f *= 1 - 0.7 * this.vsa;
       drive = f * dir;
     }
     this.drivePower = drive * vLong - (brake > 0 ? brake * Math.min(SPEC.maxBrakeForce * 0.35, 3500) * speed : 0);
 
     const force = new THREE.Vector3(0, -9.81 * SPEC.mass, 0);
     const torque = new THREE.Vector3();
+    if (vsaTorque) {
+      torque.addScaledVector(up, vsaTorque);
+      // ブレーキをつまむぶんの減速
+      force.addScaledVector(this.vel, -this.vsa * 900 / Math.max(speed, 1));
+    }
     const addForceAt = (F, P) => {
       force.add(F);
       torque.add(_t.copy(P).sub(this.pos).cross(F));
@@ -215,9 +246,10 @@ export class Vehicle {
       Fx -= SPEC.rollCoef * Fz * (surface === 'road' ? 1 : 3) * THREE.MathUtils.clamp(vl / 0.5, -1, 1);
       // 横方向(簡易マジックフォーミュラ)
       const alpha = Math.atan2(vlat, Math.max(Math.abs(vl), 3));
-      let Fy = -mu * Fz * Math.sin(1.5 * Math.atan(12 * alpha)) * (handbrake ? 0.45 : 1);
+      // 限界を超えても横の力が落ちすぎない形(すべっても戻しやすい)。後輪はやや粘る
+      let Fy = -mu * Fz * Math.sin(1.25 * Math.atan(11 * alpha)) * (handbrake ? 0.45 : 1) * (w.front ? 1 : 1.08);
       // 摩擦円
-      const lim = mu * Fz * (handbrake ? 0.6 : 1);
+      const lim = mu * Fz * (handbrake ? 0.6 : 1) * (w.front ? 1 : 1.08);
       const mag = Math.hypot(Fx, Fy);
       w.slip = lim > 0 ? Math.min(1.5, mag / lim) : 0;
       if (mag > lim && mag > 0) { Fx *= lim / mag; Fy *= lim / mag; }

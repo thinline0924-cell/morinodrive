@@ -64,6 +64,14 @@ button { font: inherit; color: inherit; }
 #help dd { margin: 0; }
 #help p { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid rgba(243,245,241,.35); font-size: 12px; opacity: .9; }
 
+/* ミニマップ:地形図の一枚を切り取った体裁 */
+#minimap { position: fixed; z-index: 4; margin: 0; left: max(20px, env(safe-area-inset-left, 0px)); bottom: max(20px, env(safe-area-inset-bottom, 0px));
+  width: 220px; background: var(--paper); box-shadow: 0 0 0 1px var(--ink), 0 2px 8px rgba(0,0,0,.25); }
+#minimap canvas { display: block; width: 220px; height: 220px; }
+#minimap figcaption { padding: 4px 8px 5px; border-top: 1px solid var(--ink); font-size: 12px; letter-spacing: .06em; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#help.with-map { bottom: calc(max(20px, env(safe-area-inset-bottom, 0px)) + 268px); }
+@media (max-width: 640px) { #minimap, #minimap canvas { width: 150px; } #minimap canvas { height: 150px; } #help.with-map { bottom: calc(max(20px, env(safe-area-inset-bottom, 0px)) + 196px); } }
+
 /* 後ろからの視点のときだけ出す速度 */
 #speed { position: fixed; z-index: 5; right: max(28px, env(safe-area-inset-right, 0px)); bottom: max(22px, env(safe-area-inset-bottom, 0px));
   color: #fff; font-family: var(--num); text-shadow: 0 1px 2px rgba(0,0,0,.55), 0 0 12px rgba(0,0,0,.25); text-align: right; pointer-events: none; }
@@ -88,6 +96,8 @@ button { font: inherit; color: inherit; }
 
 <div id="plate" aria-live="polite"><span id="plate-name"></span><span id="plate-roman"></span></div>
 
+<figure id="minimap" hidden aria-label="周辺の地図"><canvas id="minimap-canvas" width="440" height="440"></canvas><figcaption id="minimap-place"></figcaption></figure>
+
 <div id="speed" hidden><span id="speed-num">0</span><small>km/h</small></div>
 
 <aside id="help" hidden aria-label="操作方法">
@@ -99,6 +109,7 @@ button { font: inherit; color: inherit; }
     <dt>C</dt><dd>視点を切り替え(後ろ・運転席)</dd>
     <dt>ドラッグ</dt><dd>見回す</dd>
     <dt>R</dt><dd>道路に戻る</dd>
+    <dt>M</dt><dd>地図を出す・しまう</dd>
     <dt>Esc</dt><dd>一時停止</dd>
   </dl>
   <p>ゲームパッド:RT アクセル/LT ブレーキ/左スティック ハンドル/Y 視点/右スティック 見回す<br>H でこの案内を出し入れ</p>
@@ -110,6 +121,7 @@ button { font: inherit; color: inherit; }
     <button data-act="resume">走行に戻る <kbd>Esc</kbd></button>
     <button data-act="camera">視点を切り替える <kbd>C</kbd></button>
     <button data-act="reset">道路に戻る <kbd>R</kbd></button>
+    <button data-act="map">地図を出す・しまう <kbd>M</kbd></button>
     <button data-act="help">操作方法を表示 <kbd>H</kbd></button>
     <p class="pause-credit">地図:国土地理院、国土交通省 PLATEAU、© OpenStreetMap contributors を加工</p>
   </div>
@@ -119,7 +131,7 @@ button { font: inherit; color: inherit; }
   <canvas id="contours" aria-hidden="true"></canvas>
   <div class="load-body">
     <p class="place">石川県金沢市 もりの里・田上・若松</p>
-    <h1 class="title">もりの里<small>走行試作 第3版</small></h1>
+    <h1 class="title">もりの里<small>走行試作 第4版</small></h1>
     <div class="progress"><div id="load-bar"></div></div>
     <p id="load-status">読み込んでいます</p>
     <button id="start" hidden>出発する<span>Enter</span></button>

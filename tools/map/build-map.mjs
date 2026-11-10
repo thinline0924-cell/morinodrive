@@ -155,6 +155,48 @@ function minRect(pts) {
   return best;
 }
 const HOUSE = new Set([411, 413, 415]);
+// 建物の種類(ゲーム内の外観)
+const CAT = { house: 0, oldhouse: 1, apartment: 2, office: 3, school: 4, shop: 5, conv: 6, mall: 7, clinic: 8, public: 9, warehouse: 10, temple: 11, gym: 12, shed: 13, shophouse: 14, shopapt: 15 };
+function poiCategory(p) {
+  const a = p.amenity, sh = p.shop;
+  if (sh === 'convenience') return 'conv';
+  if (['supermarket', 'department_store', 'mall', 'doityourself', 'hardware', 'electronics', 'furniture'].includes(sh)) return 'mall';
+  if (sh) return 'shop';
+  if (['school', 'university', 'college', 'kindergarten', 'childcare'].includes(a)) return 'school';
+  if (['hospital', 'clinic', 'doctors', 'dentist', 'pharmacy', 'veterinary', 'nursing_home', 'social_facility'].includes(a)) return 'clinic';
+  if (['post_office', 'police', 'fire_station', 'townhall', 'library', 'community_centre', 'courthouse', 'prison'].includes(a)) return 'public';
+  if (a === 'place_of_worship') return 'temple';
+  if (['restaurant', 'cafe', 'fast_food', 'bank', 'fuel', 'bar', 'pub', 'car_wash', 'car_rental'].includes(a)) return 'shop';
+  return null;
+}
+const SIGNED = new Set(['shop', 'conv', 'mall', 'clinic', 'shophouse', 'shopapt']);
+// 店・施設の点を建物に割り当てる(中に入る建物、なければ 12m 以内で一番近い建物)
+const poiGrid = new Map();
+for (const poi of osm.pois) { const k = `${Math.floor(poi.x / 50)},${Math.floor(poi.z / 50)}`; if (!poiGrid.has(k)) poiGrid.set(k, []); poiGrid.get(k).push(poi); }
+const pip = (p, x, z) => { let inside = false; for (let i = 0, j = p.length - 1; i < p.length; j = i++) if ((p[i][1] > z) !== (p[j][1] > z) && x < (p[j][0] - p[i][0]) * (z - p[i][1]) / (p[j][1] - p[i][1]) + p[i][0]) inside = !inside; return inside; };
+const segDist = (p, x, z) => { let best = Infinity; for (let i = 0; i < p.length; i++) { const a = p[i], b = p[(i + 1) % p.length]; const dx = b[0] - a[0], dz = b[1] - a[1], L2 = dx * dx + dz * dz || 1; const t = Math.min(1, Math.max(0, ((x - a[0]) * dx + (z - a[1]) * dz) / L2)); best = Math.min(best, Math.hypot(x - a[0] - dx * t, z - a[1] - dz * t)); } return best; };
+const poiOf = new Map();
+{
+  const bgridP = new Map();
+  plateau.buildings.forEach((b, bi) => { const k = `${Math.floor(b.p[0][0] / 50)},${Math.floor(b.p[0][1] / 50)}`; if (!bgridP.has(k)) bgridP.set(k, []); bgridP.get(k).push(bi); });
+  let matched = 0;
+  for (const poi of osm.pois) {
+    let best = null;
+    for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) for (const bi of bgridP.get(`${Math.floor(poi.x / 50) + a},${Math.floor(poi.z / 50) + c}`) || []) {
+      const p = plateau.buildings[bi].p;
+      const d = pip(p, poi.x, poi.z) ? 0 : segDist(p, poi.x, poi.z);
+      if (d < 12 && (!best || d < best.d)) best = { d, bi };
+    }
+    if (best && !poiOf.has(best.bi)) { poiOf.set(best.bi, poi); matched++; }
+  }
+  console.log('pois', osm.pois.length, 'matched to buildings', matched);
+}
+// 一番近い道路(看板を向ける面を決める)
+const roadSeg = [];
+for (const w of osm.ways) for (let i = 0; i < w.pts.length - 1; i++) roadSeg.push([...w.pts[i], ...w.pts[i + 1]]);
+const roadGrid = new Map();
+roadSeg.forEach((sg, i) => { const k = `${Math.floor((sg[0] + sg[2]) / 2 / 60)},${Math.floor((sg[1] + sg[3]) / 2 / 60)}`; if (!roadGrid.has(k)) roadGrid.set(k, []); roadGrid.get(k).push(i); });
+const roadDist = (x, z) => { let best = Infinity; for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) for (const i of roadGrid.get(`${Math.floor(x / 60) + a},${Math.floor(z / 60) + c}`) || []) { const [ax, az, bx, bz] = roadSeg[i]; const dx = bx - ax, dz = bz - az, L2 = dx * dx + dz * dz || 1; const t = Math.min(1, Math.max(0, ((x - ax) * dx + (z - az) * dz) / L2)); best = Math.min(best, Math.hypot(x - ax - dx * t, z - az - dz * t)); } return best; };
 const buildings = [];
 let gable = 0;
 for (const b of plateau.buildings) {
@@ -165,18 +207,69 @@ for (const b of plateau.buildings) {
   if (A < 0) p = p.reverse(); // 反時計回り(上から見て x 右・z 下の向きで正)にそろえる
   let h = b.h || b.mh || (b.st ? b.st * 3 : 6);
   h = Math.max(2.5, Math.min(h, 80));
-  let base = Infinity;
-  for (const q of p) base = Math.min(base, heightAt(q[0], q[1]));
-  const o = { p: p.flat().map(r1), h: r1(h), g: r2(base), u: b.u || 461 };
+  // 敷地の地面:角と内側(2m おき)を調べ、いちばん高い所を建物の床にする。低い側は基礎の壁で地面まで下ろす
+  let gmax = -Infinity, gmin = Infinity;
+  const probe = (x, z) => { const v = heightAt(x, z); gmax = Math.max(gmax, v); gmin = Math.min(gmin, v); };
+  for (const q of p) probe(q[0], q[1]);
+  for (let i = 0; i < p.length; i++) { const a = p[i], c = p[(i + 1) % p.length]; probe((a[0] + c[0]) / 2, (a[1] + c[1]) / 2); }
+  {
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const q of p) { x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); z0 = Math.min(z0, q[1]); z1 = Math.max(z1, q[1]); }
+    for (let x = x0 + 1; x < x1; x += 2) for (let z = z0 + 1; z < z1; z += 2) {
+      let inside = false;
+      for (let i = 0, j = p.length - 1; i < p.length; j = i++) if ((p[i][1] > z) !== (p[j][1] > z) && x < (p[j][0] - p[i][0]) * (z - p[i][1]) / (p[j][1] - p[i][1]) + p[i][0]) inside = !inside;
+      if (inside) probe(x, z);
+    }
+  }
+  const o = { p: p.flat().map(r1), h: r1(h), g: r2(gmax), gb: r2(gmin), u: b.u || 461 };
   if (b.st) o.s = b.st;
   if (b.n) o.n = b.n;
+  // ---- 種類 ----
+  const Aabs = Math.abs(A);
+  const poi = poiOf.get(plateau.buildings.indexOf(b));
+  let cat;
+  const u = b.u;
+  const hr = ((Math.sin(p[0][0] * 12.9898 + p[0][1] * 78.233) * 43758.5453) % 1 + 1) % 1; // 位置から決まる乱数
+  if (u === 411) cat = (b.y && b.y < 1975 && hr < 0.55) || hr > 0.92 ? 'oldhouse' : 'house';
+  else if (u === 412) cat = 'apartment';
+  else if (u === 413 || u === 415) cat = 'shophouse';
+  else if (u === 414) cat = 'shopapt';
+  else if (u === 401) cat = 'office';
+  else if (u === 402 || u === 404) cat = Aabs > 2500 ? 'mall' : 'shop';
+  else if (u === 403) cat = 'office';
+  else if (u === 421) cat = 'public';
+  else if (u === 422) cat = 'school';
+  else if (u === 431 || u === 441 || u === 452) cat = 'warehouse';
+  else if (u === 451) cat = 'shed';
+  else cat = Aabs < 160 ? (h < 10 ? 'house' : 'apartment') : (h < 7 && (b.st || 1) <= 1 ? 'warehouse' : h > 9 ? 'apartment' : 'office');
+  if (poi) cat = poiCategory(poi) || cat;
+  if (cat === 'school' && Aabs > 500 && h < 15 && (b.st || 1) <= 2) cat = 'gym';
+  if (cat === 'house' && Aabs > 260) cat = 'apartment';
+  o.c = CAT[cat];
+  // ---- 屋根:倉庫・体育館・小屋・寺社にも切妻(勾配はゲーム側で種類ごとに) ----
+  if (!o.r && ['warehouse', 'gym', 'shed', 'temple', 'oldhouse', 'shophouse'].includes(cat) && Aabs < 3500 && h < 20) {
+    const r = minRect(p);
+    if (Aabs / r.ar > 0.78 && r.W > 3) o.r = [r1(r.cx), r1(r.cz), Math.round(r.ang * 1000) / 1000, r1(r.L), r1(r.W)];
+  }
+  // ---- 看板:店名を道路に面した壁に ----
+  if (poi && SIGNED.has(cat)) {
+    let bi = -1, bd = Infinity;
+    for (let i = 0; i < p.length; i++) {
+      const a = p[i], c = p[(i + 1) % p.length];
+      const L = Math.hypot(c[0] - a[0], c[1] - a[1]); if (L < 3) continue;
+      const nx = (c[1] - a[1]) / L, nz = -(c[0] - a[0]) / L;
+      const d = roadDist((a[0] + c[0]) / 2 + nx * 3, (a[1] + c[1]) / 2 + nz * 3);
+      if (d < bd) { bd = d; bi = i; }
+    }
+    if (bi >= 0 && bd < 40) o.sg = [bi, poi.name.slice(0, 18)];
+  }
   if (HOUSE.has(o.u) && Math.abs(A) < 320 && h < 13) {
     const r = minRect(p);
     if (Math.abs(A) / r.ar > 0.8 && r.W > 3) { o.r = [r1(r.cx), r1(r.cz), Math.round(r.ang * 1000) / 1000, r1(r.L), r1(r.W)]; gable++; }
   }
   buildings.push(o);
 }
-console.log('buildings', buildings.length, 'with gable roof', gable);
+console.log('buildings', buildings.length, 'with gable roof', gable, 'categories', JSON.stringify(Object.fromEntries(Object.entries(CAT).map(([k, v]) => [k, buildings.filter((b) => b.c === v).length]))), 'signs', buildings.filter((b) => b.sg).length);
 
 // ---------- 橋(道路の面は地形に描くので、宙に浮く橋だけ形を持たせる) ----------
 const bridges = [];
@@ -306,29 +399,69 @@ MASK.w = MASK.x1 - MASK.x0; MASK.h = MASK.z1 - MASK.z0;
   const hist = [0, 0, 0, 0, 0]; for (const v of raw) hist[Math.min(4, v)]++;
   console.log('land mask', MASK.w, 'x', MASK.h, 'histogram', hist.join(' '), '/ carriageway', cPix, 'sidewalk etc', sPix, '/ gsi fallback segments', extra.length);
   globalThis.__mask = raw;
+  globalThis.__rgb = rgb;
 }
 
-// ---------- 木(林):建物と道路から離れた斜面や山 ----------
+// ---------- 土地利用(2m):0 その他 1 田 2 畑 3 山林 4 その他の自然地 5 公園・緑地 6 住宅地 7 商業・公益・工業 8 空地・農業施設 ----------
 const mask = globalThis.__mask;
 const maskAt = (x, z) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); if (i < 0 || j < 0 || i >= MASK.w || j >= MASK.h) return -1; return mask[j * MASK.w + i]; };
+const LU = { 201: 1, 202: 2, 203: 3, 205: 4, 217: 5, 211: 6, 212: 7, 213: 7, 214: 7, 216: 7, 218: 7, 219: 8, 263: 8 };
+const LUW = Math.ceil(MASK.w / 2), LUH = Math.ceil(MASK.h / 2);
+let luse;
+{
+  const polys = JSON.parse(fs.readFileSync(path.join(RAW, 'luse.json')));
+  const byCat = new Map();
+  for (const pl of polys) { const c = LU[pl.c]; if (!c) continue; if (!byCat.has(c)) byCat.set(c, []); byCat.get(c).push(pl.r); }
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${LUW}" height="${LUH}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#000"/>`;
+  for (const [c, list] of byCat) {
+    const v = c * 28;
+    svg += `<path fill-rule="evenodd" fill="rgb(${v},${v},${v})" d="${list.map((rings) => rings.map((ring) => 'M' + ring.map((q) => `${((q[0] - MASK.x0) / 2).toFixed(1)},${((q[1] - MASK.z0) / 2).toFixed(1)}`).join('L') + 'Z').join('')).join('')}"/>`;
+  }
+  svg += '</svg>';
+  luse = await sharp(Buffer.from(svg), { limitInputPixels: false }).extractChannel(0).raw().toBuffer();
+  await sharp(luse, { raw: { width: LUW, height: LUH, channels: 1 } }).png({ compressionLevel: 9 }).toFile(path.join(OUT, 'landuse.png'));
+  const hist = new Array(9).fill(0); for (const v of luse) hist[Math.round(v / 28)]++;
+  console.log('landuse', LUW, 'x', LUH, hist.map((v, i) => `${i}:${(v * 4 / 1e6).toFixed(2)}km2`).join(' '));
+}
+const luAt = (x, z) => { const i = Math.floor((x - MASK.x0) / 2), j = Math.floor((z - MASK.z0) / 2); if (i < 0 || j < 0 || i >= LUW || j >= LUH) return -1; return Math.round(luse[j * LUW + i] / 28); };
+
+// ---------- 木と植え込み:[x, z, 乱数, 種類] 種類 0 杉 1 広葉樹 2 庭木 3 低木 ----------
 const bgrid = new Map();
 for (const b of buildings) { const k = `${Math.floor(b.p[0] / 40)},${Math.floor(b.p[1] / 40)}`; bgrid.set(k, (bgrid.get(k) || 0) + 1); }
 let seed = 12345; const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 const trees = [];
 const m = core.meta;
-for (let z = m.z0 + 20; z < m.z0 + (m.nz - 3) * m.spacing; z += 16) for (let x = m.x0 + 20; x < m.x0 + (m.nx - 3) * m.spacing; x += 16) {
-  const px = x + (rnd() - 0.5) * 14, pz = z + (rnd() - 0.5) * 14;
-  const h0 = heightAt(px, pz);
-  const slope = Math.hypot(heightAt(px + 6, pz) - heightAt(px - 6, pz), heightAt(px, pz + 6) - heightAt(px, pz - 6)) / 12;
-  let busy = false, nearB = 0;
-  for (const [dx, dz] of [[0, 0], [6, 0], [-6, 0], [0, 6], [0, -6], [4, 4], [-4, -4], [4, -4], [-4, 4]]) { const v = maskAt(px + dx, pz + dz); if (v > 0) { busy = true; break; } }
-  if (busy) continue;
-  for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) nearB += bgrid.get(`${Math.floor(px / 40) + a},${Math.floor(pz / 40) + c}`) || 0;
-  const wild = slope > 0.22 || (h0 > 75 && nearB < 3) || nearB === 0;
-  if (!wild || rnd() < 0.2) continue;
-  trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255));
+const clearOf = (x, z, r) => { for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r], [r * 0.7, r * 0.7], [-r * 0.7, -r * 0.7], [r * 0.7, -r * 0.7], [-r * 0.7, r * 0.7]]) { const v = maskAt(x + dx, z + dz); if (v > 0) return false; } return true; };
+const chanB = (x, z) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); if (i < 0 || j < 0 || i >= MASK.w || j >= MASK.h) return 0; return globalThis.__rgb[(j * MASK.w + i) * 3 + 2]; };
+const xEnd = m.x0 + (m.nx - 3) * m.spacing, zEnd = m.z0 + (m.nz - 3) * m.spacing;
+// 林・公園・自然地
+for (let z = m.z0 + 20; z < zEnd; z += 9) for (let x = m.x0 + 20; x < xEnd; x += 9) {
+  const px = x + (rnd() - 0.5) * 8, pz = z + (rnd() - 0.5) * 8;
+  const lu = luAt(px, pz);
+  let prob;
+  if (lu === -1 || lu === 0) {
+    // 土地利用の範囲の外:斜面と建物の少ない所を林に
+    const h0 = heightAt(px, pz);
+    const slope = Math.hypot(heightAt(px + 6, pz) - heightAt(px - 6, pz), heightAt(px, pz + 6) - heightAt(px, pz - 6)) / 12;
+    let nearB = 0; for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) nearB += bgrid.get(`${Math.floor(px / 40) + a},${Math.floor(pz / 40) + c}`) || 0;
+    prob = (slope > 0.22 || (h0 > 75 && nearB < 3) || nearB === 0) ? (lu === -1 ? 0.55 : 0.35) : 0;
+  } else prob = { 3: 0.9, 4: 0.18, 5: 0.14, 1: 0, 2: 0.01, 6: 0, 7: 0.02, 8: 0.05 }[lu] ?? 0;
+  if (rnd() >= prob || !clearOf(px, pz, 3)) continue;
+  const type = lu === 3 || lu === -1 || lu === 0 ? (rnd() < 0.55 ? 0 : 1) : 1;
+  trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), type);
 }
-console.log('trees', trees.length / 3);
+const nForest = trees.length / 4;
+// 住宅地の庭:建物のまわりの敷地(道路と建物の外)に庭木と低木
+for (let z = m.z0 + 20; z < zEnd; z += 5) for (let x = m.x0 + 20; x < xEnd; x += 5) {
+  const px = x + (rnd() - 0.5) * 4, pz = z + (rnd() - 0.5) * 4;
+  const lu = luAt(px, pz);
+  if (lu !== 6 && lu !== 7 && lu !== 5) continue;
+  const bv = chanB(px, pz);
+  if (bv < 30 || bv > 200) continue;
+  if (rnd() > (lu === 6 ? 0.5 : 0.15) || !clearOf(px, pz, 1.2)) continue;
+  trees.push(Math.round(px), Math.round(pz), Math.floor(rnd() * 255), rnd() < 0.35 ? 2 : 3);
+}
+console.log('trees', nForest, 'garden plants', trees.length / 4 - nForest);
 
 // ---------- 区画線・電柱:中心線から左右に道路の面の端を探して幅を測る ----------
 const isRoad = (x, z) => { const v = maskAt(x, z); return v === 1 || v === 2; };
@@ -461,10 +594,160 @@ const meta = {
   origin: ORIGIN, area: AREA,
   height: { core: core.meta, far: far.meta, scale: 0.01 },
   land: { x0: MASK.x0, z0: MASK.z0, w: MASK.w, h: MASK.h },
+  landuse: { x0: MASK.x0, z0: MASK.z0, w: LUW, h: LUH, cell: 2 },
 };
 fs.writeFileSync(path.join(OUT, 'meta.json'), JSON.stringify(meta, null, 1));
 fs.writeFileSync(path.join(OUT, 'buildings.json'), JSON.stringify(buildings));
-fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water }));
+// ---------- 縁石:車道の縁のうち、歩道や中央分離帯に接する所 ----------
+const RGB = globalThis.__rgb;
+const chan = (x, z, c) => { const i = Math.floor(x - MASK.x0), j = Math.floor(z - MASK.z0); if (i < 0 || j < 0 || i >= MASK.w || j >= MASK.h) return 0; return RGB[(j * MASK.w + i) * 3 + c]; };
+const curbs = [];
+{
+  const W = MASK.w, Hh = MASK.h;
+  const R = (i, j) => RGB[(j * W + i) * 3];
+  const segs = new Map(); // 端点 → 線分
+  const key = (x, z) => `${Math.round(x * 4)},${Math.round(z * 4)}`;
+  const list = [];
+  for (let j = 0; j < Hh - 1; j++) for (let i = 0; i < W - 1; i++) {
+    const a = R(i, j), b = R(i + 1, j), c = R(i + 1, j + 1), d = R(i, j + 1);
+    const T = 128;
+    const idx = (a > T ? 1 : 0) | (b > T ? 2 : 0) | (c > T ? 4 : 0) | (d > T ? 8 : 0);
+    if (idx === 0 || idx === 15) continue;
+    const pts = [];
+    const e = (p, q, x0, z0, x1, z1) => { if ((p > T) !== (q > T)) { const t = (T - p) / (q - p); pts.push([MASK.x0 + 0.5 + x0 + (x1 - x0) * t, MASK.z0 + 0.5 + z0 + (z1 - z0) * t]); } };
+    e(a, b, i, j, i + 1, j); e(b, c, i + 1, j, i + 1, j + 1); e(c, d, i + 1, j + 1, i, j + 1); e(d, a, i, j + 1, i, j);
+    for (let k = 0; k + 1 < pts.length; k += 2) list.push([pts[k], pts[k + 1]]);
+  }
+  // 歩道側(R が小さい側)に歩道・分離帯があるかを見て、縁石にする線分だけ残す
+  const keep = list.filter(([p, q]) => {
+    const mx = (p[0] + q[0]) / 2, mz = (p[1] + q[1]) / 2;
+    const dx = q[0] - p[0], dz = q[1] - p[1], L = Math.hypot(dx, dz) || 1;
+    const nx = -dz / L, nz = dx / L;
+    const r1v = chan(mx + nx * 1.2, mz + nz * 1.2, 0), r2v = chan(mx - nx * 1.2, mz - nz * 1.2, 0);
+    const sx = r1v < r2v ? nx : -nx, sz = r1v < r2v ? nz : -nz; // 車道でない側
+    const g = chan(mx + sx * 1.0, mz + sz * 1.0, 1), b = chan(mx + sx * 1.0, mz + sz * 1.0, 2);
+    return g > 40 && g < 200 && b < 250;
+  });
+  // つないで折れ線に
+  const adj = new Map();
+  keep.forEach((s3, i) => { for (const q of s3) { const k = key(...q); if (!adj.has(k)) adj.set(k, []); adj.get(k).push(i); } });
+  const used = new Uint8Array(keep.length);
+  for (let i = 0; i < keep.length; i++) {
+    if (used[i]) continue;
+    used[i] = 1;
+    const line = [keep[i][0], keep[i][1]];
+    for (const dir of [1, 0]) {
+      for (;;) {
+        const end = dir ? line.at(-1) : line[0];
+        const nb = (adj.get(key(...end)) || []).find((k) => !used[k]);
+        if (nb === undefined) break;
+        used[nb] = 1;
+        const [p, q] = keep[nb];
+        const nxt = key(...p) === key(...end) ? q : p;
+        if (dir) line.push(nxt); else line.unshift(nxt);
+      }
+    }
+    // 間引き(Douglas-Peucker 0.25m)
+    const dp = (pts) => {
+      if (pts.length < 3) return pts;
+      const [a, b] = [pts[0], pts.at(-1)];
+      let mi = 0, md = 0;
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1e-9;
+      for (let k = 1; k < pts.length - 1; k++) { const d = Math.abs((b[0] - a[0]) * (a[1] - pts[k][1]) - (a[0] - pts[k][0]) * (b[1] - a[1])) / L; if (d > md) { md = d; mi = k; } }
+      return md > 0.25 ? dp(pts.slice(0, mi + 1)).slice(0, -1).concat(dp(pts.slice(mi))) : [a, b];
+    };
+    const simp = dp(line);
+    let len = 0; for (let k = 1; k < simp.length; k++) len += Math.hypot(simp[k][0] - simp[k - 1][0], simp[k][1] - simp[k - 1][1]);
+    if (len >= 3) curbs.push(simp.flat().map(r1));
+  }
+  let total = 0, nseg = 0; for (const c of curbs) { nseg += c.length / 2 - 1; for (let k = 2; k < c.length; k += 2) total += Math.hypot(c[k] - c[k - 2], c[k + 1] - c[k - 1]); }
+  console.log('curbs', curbs.length, 'lines', nseg, 'segments', (total / 1000).toFixed(1), 'km');
+}
+
+// ---------- 中央分離帯:向きが逆の一方通行が平行に並ぶ所 ----------
+const medians = [];
+{
+  const ones = osm.ways.filter((w) => w.oneway && !w.tunnel && !w.hw.endsWith('_link'));
+  const samples = [];
+  ones.forEach((w, wi) => { for (let i = 0; i < w.pts.length - 1; i++) { const [a, b] = [w.pts[i], w.pts[i + 1]]; const L = Math.hypot(b[0] - a[0], b[1] - a[1]); const n = Math.max(1, Math.round(L / 4)); const ang = Math.atan2(b[1] - a[1], b[0] - a[0]); for (let k = 0; k < n; k++) samples.push({ wi, x: a[0] + (b[0] - a[0]) * k / n, z: a[1] + (b[1] - a[1]) * k / n, ang }); } });
+  const grid = new Map(); const gk = (x, z) => `${Math.floor(x / 30)},${Math.floor(z / 30)}`;
+  samples.forEach((sm, i) => { const k = gk(sm.x, sm.z); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(i); });
+  const mids = [];
+  for (const sm of samples) {
+    let best = null;
+    for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) for (const i of grid.get(`${Math.floor(sm.x / 30) + a},${Math.floor(sm.z / 30) + c}`) || []) {
+      const o = samples[i]; if (o.wi === sm.wi) continue;
+      if (Math.cos(o.ang - sm.ang) > -0.85) continue;
+      const d = Math.hypot(o.x - sm.x, o.z - sm.z);
+      if (d < 4 || d > 26) continue;
+      // 横に並んでいる(前後ではない)
+      const along = Math.abs((o.x - sm.x) * Math.cos(sm.ang) + (o.z - sm.z) * Math.sin(sm.ang));
+      if (along > 3) continue;
+      if (!best || d < best.d) best = { d, o };
+    }
+    if (!best) continue;
+    const w1 = ones[sm.wi].w, w2 = ones[best.o.wi].w;
+    const mw = best.d - w1 / 2 - w2 / 2;
+    if (mw < 1.0) continue;
+    const mx = (sm.x + best.o.x) / 2, mz = (sm.z + best.o.z) / 2;
+    // 分離帯の中が本当に車道でないか
+    if (chan(mx, mz, 0) > 100) continue;
+    mids.push({ x: mx, z: mz, ang: sm.ang, w: mw });
+  }
+  // 近い点をつないで帯にする(向きのそろった 4m おきの点列)
+  mids.sort((a, b) => a.x - b.x);
+  const usedM = new Uint8Array(mids.length);
+  for (let i = 0; i < mids.length; i++) {
+    if (usedM[i]) continue;
+    const run = [mids[i]]; usedM[i] = 1;
+    for (const dir of [1, -1]) {
+      for (;;) {
+        const end = dir > 0 ? run.at(-1) : run[0];
+        let bj = -1, bd = 7;
+        for (let j = 0; j < mids.length; j++) { if (usedM[j]) continue; const d = Math.hypot(mids[j].x - end.x, mids[j].z - end.z); if (d < bd && d > 0.5) { const fx = mids[j].x - end.x, fz = mids[j].z - end.z; if (Math.abs(fx * Math.sin(end.ang) - fz * Math.cos(end.ang)) < 2.5) { bd = d; bj = j; } } }
+        if (bj < 0) break;
+        usedM[bj] = 1;
+        if (dir > 0) run.push(mids[bj]); else run.unshift(mids[bj]);
+      }
+    }
+    if (run.length < 3) continue;
+    // 進む向きにそろえる
+    const ordered = run[0].x * Math.cos(run[0].ang) + run[0].z * Math.sin(run[0].ang) <= run.at(-1).x * Math.cos(run[0].ang) + run.at(-1).z * Math.sin(run[0].ang) ? run : run.reverse();
+    medians.push({ p: ordered.flatMap((q) => [r1(q.x), r1(q.z)]), w: ordered.map((q) => r1(Math.min(q.w, 8))) });
+  }
+  console.log('medians', medians.length, 'points', medians.reduce((s3, m) => s3 + m.w.length, 0));
+}
+
+// ---------- 街路樹:主な道路で、歩道の幅が 2.5m 以上ある所に 12m おき ----------
+const streetTrees = [];
+{
+  const MAIN = new Set(['trunk', 'primary', 'secondary', 'tertiary']);
+  for (const w of osm.ways) {
+    if (!MAIN.has(w.hw) || w.tunnel || w.bridge) continue;
+    let acc = 0;
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const [a, b] = [w.pts[i], w.pts[i + 1]];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]); const ang = Math.atan2(b[1] - a[1], b[0] - a[0]);
+      const lx = Math.sin(ang), lz = -Math.cos(ang);
+      for (let t = 0; t < L; t += 2) {
+        acc += 2; if (acc < 12) continue;
+        const x = a[0] + (b[0] - a[0]) * t / L, z = a[1] + (b[1] - a[1]) * t / L;
+        for (const side of [1, -1]) {
+          // 車道の端を越えて、歩道がどこまで続くか
+          let d = w.w / 2; while (d < w.w / 2 + 6 && chan(x + lx * side * d, z + lz * side * d, 0) > 100) d += 0.25;
+          let e = d; while (e < d + 8 && (() => { const g = chan(x + lx * side * e, z + lz * side * e, 1); return g > 60 && g < 200; })()) e += 0.25;
+          if (e - d < 2.5) continue;
+          const td = d + 0.9;
+          streetTrees.push(r1(x + lx * side * td), r1(z + lz * side * td));
+        }
+        acc = 0;
+      }
+    }
+  }
+  console.log('street trees', streetTrees.length / 2);
+}
+
+fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water, curbs, medians, streetTrees }));
 const RANK = { trunk: 3, primary: 3, motorway: 3, secondary: 2, tertiary: 2, unclassified: 1, residential: 1, living_street: 1, service: 0 };
 fs.writeFileSync(path.join(OUT, 'lines.json'), JSON.stringify({
   lines: osm.ways.filter((w) => !w.tunnel).map((w) => ({ w: RANK[w.hw.replace('_link', '')] ?? 1, cw: r1(w.w), o: w.oneway ? 1 : 0, n: w.name || w.ref || undefined, v: w.maxspeed || undefined, p: w.pts.flat().map(r1) })),

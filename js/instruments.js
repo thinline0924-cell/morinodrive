@@ -114,6 +114,13 @@ export class Instruments {
       g.strokeStyle = '#5cc980'; g.lineWidth = 3; g.strokeRect(58, 196, 62, 38);
       g.fillStyle = '#5cc980'; g.font = `600 28px ${NUM}`; g.fillText('EV', 72, 226);
     }
+    // 横すべり防止が働いているときの表示灯(点滅)
+    if ((v.vsa || 0) > 0.05 && Math.floor(performance.now() / 250) % 2 === 0) {
+      g.fillStyle = '#f2a516'; g.font = `600 22px ${NUM}`;
+      g.beginPath(); g.moveTo(150, 200); g.lineTo(178, 200); g.lineTo(174, 232); g.lineTo(154, 232); g.closePath(); g.fill();
+      g.fillStyle = '#05080b'; g.fillText('S', 158, 225);
+      g.fillStyle = '#f2a516'; g.fillText('VSA', 186, 226);
+    }
     // 電池残量
     g.fillStyle = 'rgba(220,228,235,0.6)'; g.font = `500 20px ${NUM}`; g.fillText('BATT', 58, 290);
     for (let i = 0; i < 8; i++) {
