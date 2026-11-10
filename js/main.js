@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { Sky } from 'three/addons/objects/Sky.js';
-import { Course } from './course.js';
+import { World } from './world.js';
 import { Vehicle, SPEC } from './vehicle.js';
 import { Instruments } from './instruments.js';
 import { Input } from './input.js';
@@ -15,7 +15,7 @@ const ui = {
 };
 
 // ---------- 描画の土台 ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -26,7 +26,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 $('view').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 6000);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 14000);
 
 // 空と太陽(晴れた日の午後、南西寄りから)
 const sky = new Sky();
@@ -46,7 +46,7 @@ scene.add(sky);
   scene.environment = pm.fromScene(envScene, 0, 0.1, 2000).texture;
   scene.environmentIntensity = 0.55;
 }
-scene.fog = new THREE.FogExp2(0xb4c8dc, 0.00038);
+scene.fog = new THREE.FogExp2(0xb4c8dc, 0.00021);
 
 const hemi = new THREE.HemisphereLight(0xd6e8f8, 0x6b7552, 1.1);
 scene.add(hemi);
@@ -58,9 +58,8 @@ sc.left = -45; sc.right = 45; sc.top = 45; sc.bottom = -45; sc.near = 1; sc.far 
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
 
-// ---------- 土地 ----------
-const course = new Course();
-course.build(scene, renderer);
+// ---------- 土地(実際の地図) ----------
+let world = null;
 
 // ---------- 車 ----------
 const manager = new THREE.LoadingManager();
@@ -74,9 +73,14 @@ let camMode = 'chase';
 let paused = false;
 let started = false;
 
+const prog = { map: 0, car: 0 };
 function setProgress(p, text) {
   ui.bar.style.transform = `scaleX(${p})`;
   ui.status.textContent = text;
+}
+function showLoad() {
+  const p = prog.map * 0.6 + prog.car * 0.4;
+  setProgress(p * 0.97, `地図と車を読み込んでいます ${Math.round(p * 100)}%`);
 }
 
 // 車のデータは配信の都合で base64 のテキストにしてある。読み込みながら進み具合を出す
@@ -84,7 +88,7 @@ async function fetchCar(url, approxBytes) {
   // 手元のサーバーでは .glb をそのまま、配信先では base64 のテキストを読む
   const raw = await fetch('assets/car.glb').catch(() => null);
   if (raw && raw.ok && !/text|html/.test(raw.headers.get('content-type') || '')) {
-    setProgress(0.9, '車を読み込んでいます');
+    prog.car = 0.9; showLoad();
     return raw.arrayBuffer();
   }
   const res = await fetch(url);
@@ -97,8 +101,8 @@ async function fetchCar(url, approxBytes) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value); got += value.length;
-    const p = Math.min(1, got / total);
-    setProgress(p * 0.95, `車を読み込んでいます ${Math.round(p * 100)}%`);
+    prog.car = Math.min(1, got / total);
+    showLoad();
   }
   const text = new TextDecoder().decode(await new Blob(chunks).arrayBuffer());
   const bin = atob(text.trim());
@@ -107,7 +111,13 @@ async function fetchCar(url, approxBytes) {
   return buf.buffer;
 }
 
-fetchCar('assets/car.b64.txt', 4363048).then((buf) => new Promise((ok, ng) => loader.parse(buf, '', ok, ng))).then((gltf) => {
+const mapReady = World.load('assets/map/', (p) => { prog.map = p; showLoad(); }).then((w) => {
+  world = w;
+  setProgress(0.97, '街を組み立てています');
+  return new Promise((ok) => setTimeout(() => { world.build(scene, renderer); ok(); }, 30));
+});
+const carReady = fetchCar('assets/car.b64.txt', 4363048).then((buf) => new Promise((ok, ng) => loader.parse(buf, '', ok, ng)));
+Promise.all([carReady, mapReady]).then(([gltf]) => {
   carRoot = gltf.scene;
   carRoot.traverse((o) => {
     if (o.isMesh) {
@@ -127,15 +137,16 @@ fetchCar('assets/car.b64.txt', 4363048).then((buf) => new Promise((ok, ng) => lo
   steering = carRoot.getObjectByName('steering');
   steering.userData.axisV = new THREE.Vector3(...steering.userData.axis);
   steering.userData.q0 = steering.quaternion.clone();
-  vehicle = new Vehicle(course, defs);
-  const sp = course.spawnNear(-120, 160);
+  vehicle = new Vehicle(world, defs);
+  // 出発はもりの里一丁目、大きな商業施設の前の広い道
+  const sp = world.spawnNear(-560, -100, 3);
   vehicle.reset(sp.x, sp.z, sp.heading);
-  instruments = new Instruments(carRoot, course, renderer);
+  instruments = new Instruments(carRoot, world, renderer);
   setProgress(1, '準備ができました');
   ui.start.hidden = false;
   ui.start.focus();
 }).catch((err) => {
-  ui.status.textContent = '車のデータを読み込めませんでした。ページを再読み込みしてください。';
+  ui.status.textContent = '地図か車のデータを読み込めませんでした。ページを再読み込みしてください。';
   console.error(err);
 });
 
@@ -143,14 +154,14 @@ ui.start.addEventListener('click', () => {
   started = true;
   ui.loader.classList.add('gone');
   setTimeout(() => (ui.loader.hidden = true), 700);
-  showPlate('試走コース', 'Test course');
+  currentPlace = null;
   ui.help.hidden = false;
   helpTimer = 14;
   renderer.domElement.focus();
 });
 
 // ---------- 画面上の表示 ----------
-let plateTimer = 0, helpTimer = 0;
+let plateTimer = 0, helpTimer = 0, currentPlace = null, placeTimer = 0;
 function showPlate(name, roman) {
   ui.plateName.textContent = name;
   ui.plateRoman.textContent = roman;
@@ -160,7 +171,7 @@ function showPlate(name, roman) {
 input.on('camera', () => { if (started && !paused) camMode = camMode === 'chase' ? 'cockpit' : 'chase'; lookYaw = lookPitch = 0; input.mouseLook.x = input.mouseLook.y = 0; });
 input.on('reset', () => {
   if (!vehicle || !started) return;
-  const sp = course.spawnNear(vehicle.pos.x, vehicle.pos.z);
+  const sp = world.spawnNear(vehicle.pos.x, vehicle.pos.z);
   vehicle.reset(sp.x, sp.z, sp.heading);
   chase.init = false;
 });
@@ -215,9 +226,15 @@ function updateCamera(dt) {
     chase.pos.lerp(target, 1 - Math.exp(-dt * 5));
     chase.look.lerp(look, 1 - Math.exp(-dt * 9));
     // 地面にもぐらない
-    const gh = course.height(chase.pos.x, chase.pos.z) + 0.6;
+    const gh = world.height(chase.pos.x, chase.pos.z) + 0.6;
     if (chase.pos.y < gh) chase.pos.y = gh;
     camera.position.copy(chase.pos);
+    // 建物にめり込むときは、車に寄せる
+    const from = v.pos, to = chase.pos;
+    for (let t = 0.15; t <= 1; t += 0.05) {
+      const x = from.x + (to.x - from.x) * t, z = from.z + (to.z - from.z) * t;
+      if (world.isBuilding(x, z)) { camera.position.lerpVectors(from, to, Math.max(0.12, t - 0.08)); camera.position.y = Math.max(camera.position.y, from.y + 1.6); break; }
+    }
     camera.lookAt(chase.look);
   }
   camera.updateProjectionMatrix();
@@ -239,8 +256,20 @@ function frame() {
       n.spin.rotation.z = -w.spin;
     }
     steering.quaternion.setFromAxisAngle(steering.userData.axisV, vehicle.steerAngle * SPEC.steerRatio).multiply(steering.userData.q0);
-    instruments.update(dt, vehicle, '試走コース');
+    // いまいる町(住居表示板):近い町名が変わったら出す
+    placeTimer -= dt;
+    if (placeTimer <= 0) {
+      placeTimer = 0.5;
+      const pl = world.placeAt(vehicle.pos.x, vehicle.pos.z);
+      if (pl && pl !== currentPlace) {
+        currentPlace = pl;
+        if (started) showPlate(pl.n, pl.r);
+      }
+    }
+    instruments.update(dt, vehicle, currentPlace ? currentPlace.n : '');
     updateCamera(dt);
+    const fc = window.__drive?.freeCam; // 確認用の上空カメラ
+    if (fc) { camera.position.set(...fc.pos); camera.lookAt(...fc.look); camera.updateProjectionMatrix(); }
     // 影は車のまわりだけ細かく
     sun.target.position.copy(vehicle.pos);
     sun.position.copy(vehicle.pos).addScaledVector(sunDir, 200);
@@ -253,8 +282,8 @@ function frame() {
   } else {
     // 読み込み中はコースの上をゆっくり回る
     const t = performance.now() / 1000;
-    camera.position.set(Math.cos(t * 0.05) * 320, 120, Math.sin(t * 0.05) * 320);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(Math.cos(t * 0.05) * 900, 420, Math.sin(t * 0.05) * 900);
+    camera.lookAt(0, 80, 0);
   }
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
@@ -268,4 +297,4 @@ addEventListener('resize', () => {
 });
 
 // 動作確認用(自動テストから車を動かす)
-window.__drive = { get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };
+window.__drive = { get info() { return { ...renderer.info.render, geometries: renderer.info.memory.geometries }; }, teleport: (x, z, w = 1) => { const sp = world.spawnNear(x, z, w); vehicle.reset(sp.x, sp.z, sp.heading); chase.init = false; return sp; }, get world() { return world; }, get vehicle() { return vehicle; }, get instruments() { return instruments; }, eye: EYE, input, setCam: (m) => (camMode = m), start: () => ui.start.click() };

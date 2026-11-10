@@ -53,6 +53,10 @@ export class Vehicle {
     // 車体の当たり判定用の点(横転したときに地面へ潜らないように)
     this.hull = [];
     for (const x of [-2.05, 2.1]) for (const z of [-0.82, 0.82]) { this.hull.push(new THREE.Vector3(x, 0.3, z), new THREE.Vector3(x * 0.85, 1.72, z * 0.9)); }
+    // 建物とぶつかる点(バンパーと側面の高さ)
+    this.bumpers = [];
+    for (const x of [-2.1, -1.1, 0, 1.1, 2.15]) for (const z of [-0.84, 0.84]) this.bumpers.push(new THREE.Vector3(x, 0.55, z));
+    this.bumpers.push(new THREE.Vector3(2.18, 0.55, 0), new THREE.Vector3(-2.12, 0.55, 0));
     this.steerInput = 0;
     this.steerAngle = 0;
     this.gear = 'P';
@@ -199,7 +203,7 @@ export class Vehicle {
 
       const surface = this.ground.surface(contact.x, contact.z);
       w.surface = surface;
-      const mu = surface === 'road' ? 1.0 : 0.62;
+      const mu = surface === 'road' ? 1.0 : surface === 'lot' ? 0.9 : 0.62;
       const handbrake = input.handbrake && !w.front;
 
       // 前後方向
@@ -273,6 +277,28 @@ export class Vehicle {
         const vu = this.vel.dot(up);
         this.vel.copy(up).multiplyScalar(vu);
         this.angVel.multiplyScalar(0.8);
+      }
+    }
+
+    // ---------- 建物との当たり:めり込んだ分を押し戻し、壁へ向かう速さを消す ----------
+    if (this.ground.obstacle) {
+      for (const bp of this.bumpers) {
+        const P = this.toWorld(bp, new THREE.Vector3());
+        const ob = this.ground.obstacle(P.x, P.z);
+        if (!ob || ob.depth > 1.5) continue;
+        const n = new THREE.Vector3(ob.x, 0, ob.z);
+        this.pos.addScaledVector(n, ob.depth + 0.01);
+        const rel = P.sub(this.pos);
+        const vc = this.angVel.clone().cross(rel).add(this.vel);
+        const vn = vc.dot(n);
+        if (vn < 0) {
+          this.bump = Math.max(this.bump || 0, Math.min(1, -vn / 8));
+          this.vel.addScaledVector(n, -vn * 1.08);
+          // 壁沿いの動きは少し落とし、回転も弱める
+          const vt = this.vel.clone().addScaledVector(n, -this.vel.dot(n)); vt.y = 0;
+          this.vel.addScaledVector(vt, -Math.min(0.25, 0.04 * -vn));
+          this.angVel.multiplyScalar(0.85);
+        }
       }
     }
 

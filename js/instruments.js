@@ -155,25 +155,7 @@ export class Instruments {
     const px = 2.4; // 1m = 2.4px(横幅で約430m)
     const heading = Math.atan2(new THREE.Vector3(1, 0, 0).applyQuaternion(v.quat).z, new THREE.Vector3(1, 0, 0).applyQuaternion(v.quat).x);
     const cx = W / 2, cy = H * 0.62;
-    g.save();
-    g.translate(cx, cy);
-    g.rotate(-heading - Math.PI / 2); // 進行方向を上に
-    g.translate(-v.pos.x * px, -v.pos.z * px);
-    // 林の面
-    g.fillStyle = 'rgba(160,184,140,0.35)';
-    for (let i = -6; i <= 6; i++) for (let j = -6; j <= 6; j++) {
-      const x = Math.round(v.pos.x / 60) * 60 + i * 60, z = Math.round(v.pos.z / 60) * 60 + j * 60;
-      if (Math.sin(x * 0.021) * Math.cos(z * 0.018) > 0.35) g.fillRect(x * px, z * px, 60 * px, 60 * px);
-    }
-    const pts = this.course.polyline();
-    const path = () => { g.beginPath(); pts.forEach((p, i) => (i ? g.lineTo(p.x * px, p.z * px) : g.moveTo(p.x * px, p.z * px))); g.closePath(); };
-    g.lineJoin = 'round';
-    path(); g.strokeStyle = '#9a8f78'; g.lineWidth = 7.6 * px + 4; g.stroke();
-    path(); g.strokeStyle = '#fbfaf5'; g.lineWidth = 7.6 * px; g.stroke();
-    // 等高線(丘)
-    g.strokeStyle = 'rgba(160,120,80,0.45)'; g.lineWidth = 1.5;
-    for (let r = 30; r <= 150; r += 30) { g.beginPath(); g.ellipse(150 * px, -60 * px, r * px, r * px, 0, 0, Math.PI * 2); g.stroke(); }
-    g.restore();
+    this.course.drawNav(g, v.pos.x, v.pos.z, heading, px, W, H, cx, cy);
     // 自車
     g.save(); g.translate(cx, cy);
     g.fillStyle = '#c8352b'; g.strokeStyle = '#fff'; g.lineWidth = 4;
