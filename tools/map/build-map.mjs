@@ -290,6 +290,16 @@ for (const b of plateau.buildings) {
   }
   buildings.push(o);
 }
+// 360°写真(Mapillary)から読んだ壁の色(tools/map/mly-colors.mjs の結果。前回の buildings.json と同じ番号)
+{
+  const f = path.join(RAW, 'mly/wallcolors.json');
+  if (fs.existsSync(f)) {
+    const wc = JSON.parse(fs.readFileSync(f));
+    let n = 0;
+    for (const [i, c] of Object.entries(wc)) if (buildings[i]) { buildings[i].wc = c; n++; }
+    console.log('wall colors from street photos', n);
+  }
+}
 console.log('buildings', buildings.length, 'with gable roof', gable, 'categories', JSON.stringify(Object.fromEntries(Object.entries(CAT).map(([k, v]) => [k, buildings.filter((b) => b.c === v).length]))), 'signs', buildings.filter((b) => b.sg).length);
 
 // ---------- 橋(道路の面は地形に描くので、宙に浮く橋だけ形を持たせる) ----------
@@ -642,7 +652,7 @@ for (const sgn of osm.signals) {
 console.log('markings', markings.length, 'crosswalks', crosswalks.length, 'signal heads', signals.length, 'intersections', groups.length, 'stop lines', stops.length, 'poles', poles.length / 3);
 
 const meta = {
-  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル・シームレス空中写真)、国土交通省 PLATEAU 金沢市 2024、© OpenStreetMap contributors(ODbL)。加工して作成',
+  source: '出典:国土地理院(地理院タイル 標高・最適化ベクトルタイル・シームレス空中写真)、国土交通省 PLATEAU 金沢市 2024、© OpenStreetMap contributors(ODbL)、© Mapillary contributors(CC BY-SA 4.0)。加工して作成',
   origin: ORIGIN, area: AREA,
   height: { core: core.meta, far: far.meta, scale: 0.01 },
   land: { x0: MASK.x0, z0: MASK.z0, w: MASK.w, h: MASK.h },
@@ -959,6 +969,76 @@ const walls = [];
 await sharp(globalThis.__rgb, { raw: { width: MASK.w, height: MASK.h, channels: 3 }, limitInputPixels: false }).png({ compressionLevel: 9 }).toFile(path.join(OUT, 'land.png'));
 
 fs.writeFileSync(path.join(OUT, 'roads.json'), JSON.stringify({ bridges, markings, crosswalks, stops, water, curbs, medians, streetTrees, walls }));
+// ---------- Mapillary が写真から検出した物:電柱・街灯・標識・マンホール ----------
+const mlyLights = [], mlySigns = [], manholes = [];
+{
+  const f = path.join(RAW, 'mly/features.json');
+  const imgs = path.join(RAW, 'mly/images.json');
+  if (fs.existsSync(f)) {
+    const feats = JSON.parse(fs.readFileSync(f));
+    // 写真がある所(撮影地点から 30m 以内)を 20m の格子で覚える
+    const seen = new Set();
+    for (const d of JSON.parse(fs.readFileSync(imgs))) { const [x, z] = toLocal(d.geometry.coordinates[1], d.geometry.coordinates[0]); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) seen.add(`${Math.floor(x / 20) + a},${Math.floor(z / 20) + b}`); }
+    const covered = (x, z) => seen.has(`${Math.floor(x / 20)},${Math.floor(z / 20)}`);
+    // 道路の上に出ないよう、車道の外へ押し出す
+    const offRoad = (x, z) => {
+      if (chan(x, z, 0) < 100) return [x, z];
+      for (let r = 0.5; r <= 6; r += 0.5) for (let a = 0; a < 12; a++) { const th = a / 12 * Math.PI * 2, px = x + Math.cos(th) * r, pz = z + Math.sin(th) * r; if (chan(px, pz, 0) < 100 && maskAt(px, pz) !== 4) return [px, pz]; }
+      return null;
+    };
+    // 推定の電柱は、写真がある所では検出された電柱に置き換える
+    const keepPoles = [], remap = new Map();
+    for (let i = 0; i < poles.length / 3; i++) if (!covered(poles[i * 3], poles[i * 3 + 1])) { remap.set(i, keepPoles.length / 3); keepPoles.push(poles[i * 3], poles[i * 3 + 1], poles[i * 3 + 2]); }
+    const newWires = [];
+    for (let k = 0; k < wires.length; k += 2) if (remap.has(wires[k]) && remap.has(wires[k + 1])) newWires.push(remap.get(wires[k]), remap.get(wires[k + 1]));
+    const est = poles.length / 3;
+    poles.length = 0; poles.push(...keepPoles); wires.length = 0; wires.push(...newWires);
+    const roadDir = (x, z) => { const r = osm.ways.length && (() => { let best = null; for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) for (const i of roadGrid.get(`${Math.floor(x / 60) + a},${Math.floor(z / 60) + c}`) || []) { const [ax, az, bx, bz] = roadSeg[i]; const dx = bx - ax, dz = bz - az, L2 = dx * dx + dz * dz || 1; const t = Math.min(1, Math.max(0, ((x - ax) * dx + (z - az) * dz) / L2)); const d = Math.hypot(x - ax - dx * t, z - az - dz * t); if (!best || d < best.d) best = { d, ang: Math.atan2(dz, dx), px: ax + dx * t, pz: az + dz * t }; } return best; })(); return r; };
+    const detPoles = [];
+    for (const ft of feats) {
+      const [x0, z0] = toLocal(ft.geometry.coordinates[1], ft.geometry.coordinates[0]);
+      const v = ft.object_value;
+      if (v === 'object--support--utility-pole') {
+        const q = offRoad(x0, z0); if (!q) continue;
+        if (detPoles.some((d) => Math.hypot(d[0] - q[0], d[1] - q[1]) < 4)) continue;
+        const rd = roadDir(...q);
+        detPoles.push([q[0], q[1], rd ? rd.ang : 0]);
+      } else if (v === 'object--street-light') {
+        const q = offRoad(x0, z0); if (!q) continue;
+        if (mlyLights.some((d) => Math.hypot(d[0] - q[0], d[1] - q[1]) < 5)) continue;
+        const rd = roadDir(...q);
+        // 灯は道路の方へ向ける
+        const ang = rd ? Math.atan2(rd.pz - q[1], rd.px - q[0]) : 0;
+        mlyLights.push([r1(q[0]), r1(q[1]), Math.round(ang * 1000) / 1000]);
+      } else if (/^(regulatory|warning)--/.test(v)) {
+        const q = offRoad(x0, z0); if (!q) continue;
+        const rd = roadDir(...q);
+        const dir = ft.aligned_direction != null ? (90 - ft.aligned_direction) * Math.PI / 180 : rd ? rd.ang : 0;
+        mlySigns.push([r1(q[0]), r1(q[1]), Math.round(dir * 1000) / 1000, v.replace(/--g\d$/, '')]);
+      } else if (v === 'object--manhole' || v === 'object--catch-basin') {
+        manholes.push(r1(x0), r1(z0), v === 'object--manhole' ? 0 : 1);
+      }
+    }
+    // 検出された電柱をつなぐ:同じ道路沿いで 20〜50m 離れた一番近いもの
+    const base = poles.length / 3;
+    for (const d of detPoles) poles.push(r1(d[0]), r1(d[1]), Math.round(((d[2] + Math.PI) / (2 * Math.PI)) * 255));
+    for (let i = 0; i < detPoles.length; i++) {
+      let best = -1, bd = 50;
+      for (let j = 0; j < detPoles.length; j++) {
+        if (j === i) continue;
+        const dx = detPoles[j][0] - detPoles[i][0], dz = detPoles[j][1] - detPoles[i][1], d = Math.hypot(dx, dz);
+        if (d < 15 || d >= bd) continue;
+        if (Math.abs(Math.sin(Math.atan2(dz, dx) - detPoles[i][2])) > 0.35) continue; // 道路に沿う向きだけ
+        // 先(進む向き)にあるものだけ。逆向きは相手の側でつなぐ
+        if (dx * Math.cos(detPoles[i][2]) + dz * Math.sin(detPoles[i][2]) <= 0) continue;
+        best = j; bd = d;
+      }
+      if (best >= 0) wires.push(base + i, base + best);
+    }
+    console.log('mapillary: poles estimated', est, '→ kept', keepPoles.length / 3, '+ detected', detPoles.length, '; street lights', mlyLights.length, '; typed signs', mlySigns.length, '; manholes', manholes.length / 3);
+  }
+}
+
 // ---------- ガードレール:住宅地の外で、道路の脇が 1.2m 以上落ち込んでいる所 ----------
 const guards = [];
 for (const w of osm.ways) {
@@ -1012,8 +1092,8 @@ console.log('speed signs', speedSigns.length);
 
 const RANK = { trunk: 3, primary: 3, motorway: 3, secondary: 2, tertiary: 2, unclassified: 1, residential: 1, living_street: 1, service: 0 };
 fs.writeFileSync(path.join(OUT, 'lines.json'), JSON.stringify({
-  lines: osm.ways.filter((w) => !w.tunnel).map((w) => ({ w: RANK[w.hw.replace('_link', '')] ?? 1, cw: r1(w.w), o: w.oneway ? 1 : 0, n: w.name || w.ref || undefined, v: w.maxspeed || undefined, p: w.pts.flat().map(r1) })),
-  poles, signals, wires, guards, speedSigns,
+  lines: osm.ways.filter((w) => !w.tunnel).map((w) => ({ w: RANK[w.hw.replace('_link', '')] ?? 1, cw: r1(w.w), o: w.oneway ? 1 : 0, b: w.bridge || Number(w.tags.layer) > 0 ? 1 : undefined, n: w.name || w.ref || undefined, v: w.maxspeed || undefined, p: w.pts.flat().map(r1) })),
+  poles, signals, wires, guards, speedSigns, mlyLights, mlySigns, manholes,
 }));
 fs.writeFileSync(path.join(OUT, 'places.json'), JSON.stringify({ places, trees }));
 for (const f of fs.readdirSync(OUT)) console.log(f, (fs.statSync(path.join(OUT, f)).size / 1e6).toFixed(2), 'MB');

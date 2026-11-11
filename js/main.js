@@ -357,7 +357,7 @@ function frame() {
     if (started && !paused) audio.update(dt, vehicle, { cockpit: camMode === 'cockpit' });
     updateCamera(dt);
     const fc = window.__drive?.freeCam; // 確認用の上空カメラ
-    if (fc) { camera.position.set(...fc.pos); camera.lookAt(...fc.look); camera.updateProjectionMatrix(); }
+    if (fc) { camera.position.set(...fc.pos); camera.lookAt(...fc.look); if (fc.fov) camera.fov = fc.fov; camera.updateProjectionMatrix(); }
     // 影は車のまわりだけ細かく
     sun.target.position.copy(vehicle.pos);
     sun.position.copy(vehicle.pos).addScaledVector(sunDir, 200);

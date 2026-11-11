@@ -70,6 +70,9 @@ export class World {
     this.wires = d.lines.wires || [];
     this.guards = d.lines.guards || [];
     this.speedSigns = d.lines.speedSigns || [];
+    this.mlyLights = d.lines.mlyLights || [];
+    this.mlySigns = d.lines.mlySigns || [];
+    this.manholes = d.lines.manholes || [];
     this.curbs = d.roads.curbs || [];
     this.medians = d.roads.medians || [];
     this.streetTrees = d.roads.streetTrees || [];
@@ -80,6 +83,8 @@ export class World {
     for (const sg of this.signals) this._addSolid({ x: sg[0], z: sg[1], r: 0.18 });
     for (const g of this.guards) for (let i = 0; i + 3 < g.length; i += 2) this._addSolid({ x: g[i], z: g[i + 1], bx: g[i + 2], bz: g[i + 3], r: 0.15 });
     for (const ss of this.speedSigns) this._addSolid({ x: ss[0], z: ss[1], r: 0.1 });
+    for (const l of this.mlyLights) this._addSolid({ x: l[0], z: l[1], r: 0.14 });
+    for (const sg of this.mlySigns) this._addSolid({ x: sg[0], z: sg[1], r: 0.08 });
     for (const w of this.walls) for (let i = 0; i + 3 < w.p.length; i += 2) this._addSolid({ x: w.p[i], z: w.p[i + 1], bx: w.p[i + 2], bz: w.p[i + 3], r: w.t === 1 ? 0.35 : 0.12 });
     for (let i = 0; i < this.streetTrees.length; i += 2) this._addSolid({ x: this.streetTrees[i], z: this.streetTrees[i + 1], r: 0.3 });
     for (const m of this.medians) for (let i = 0; i + 3 < m.p.length; i += 2) {
@@ -271,6 +276,7 @@ export class World {
     this._buildWires(scene);
     this._buildGuards(scene);
     this._buildSpeedSigns(scene);
+    this._buildMlyObjects(scene);
     this._buildMedians(scene);
     this._buildSignals(scene);
   }
@@ -531,7 +537,9 @@ uniform int usePhoto;`)
       const houseTile = rnd() < 0.5 ? 0 : 1;
       fac = [st[0] < 0 ? houseTile : st[0], st[1] < 0 ? houseTile : st[1]];
       const G = ch.wall;
-      const wallCol = tmp.set(pick(st[4])).clone().multiplyScalar(0.93 + rnd() * 0.1);
+      const pickedWall = tmp.set(pick(st[4])).clone().multiplyScalar(0.93 + rnd() * 0.1);
+      // 道路からの 360°写真で色が分かった建物は、その色(日なた・日陰の差をならして明るさを整える)
+      const wallCol = b.wc != null ? photoWall(b.wc) : pickedWall;
       const wallLow = wallCol.clone().multiplyScalar(Math.max(0.62, 1 - 1.6 / Math.max(3, b.h)));
       const g0 = (b.gb ?? b.g) - 0.4; // 低い側は基礎の壁で地面まで
       let top = b.g + b.h, eave = top;
@@ -1059,6 +1067,90 @@ uniform int usePhoto;`)
     }
   }
 
+  // ---------- Mapillary が写真から検出した街灯・標識・マンホール ----------
+  _buildMlyObjects(scene) {
+    const metal = new THREE.MeshStandardMaterial({ color: 0x8f9396, roughness: 0.45, metalness: 0.5 });
+    const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), S = new THREE.Vector3(1, 1, 1), V = new THREE.Vector3(), Y = new THREE.Vector3(0, 1, 0);
+    // 街灯:高さ 8m の柱、道路へ 1.5m 腕を出した先に灯具
+    const n = this.mlyLights.length;
+    if (n) {
+      const pole = new THREE.CylinderGeometry(0.07, 0.11, 8, 6, 1, true).translate(0, 4, 0);
+      const arm = new THREE.CylinderGeometry(0.04, 0.04, 1.6, 5, 1, true).rotateZ(Math.PI / 2).translate(0.8, 7.9, 0);
+      const head = new THREE.BoxGeometry(0.6, 0.12, 0.28).translate(1.55, 7.85, 0);
+      const geo = mergeGeometries([pole, arm.toNonIndexed ? arm : arm, head].map((g) => (g.index ? g.toNonIndexed() : g)).map((g) => { g.deleteAttribute('uv'); return g; }));
+      const im = new THREE.InstancedMesh(geo, metal, n);
+      this.mlyLights.forEach(([x, z, a], i) => { Q.setFromAxisAngle(Y, -a); M.compose(V.set(x, this.terrainHeight(x, z) - 0.1, z), Q, S); im.setMatrixAt(i, M); });
+      im.castShadow = true;
+      scene.add(im);
+    }
+    // 標識:種類ごとの絵を 1 枚にまとめる
+    const kinds = [...new Set(this.mlySigns.map((q) => q[3]))];
+    if (kinds.length) {
+      const T = 128, C = document.createElement('canvas'); C.width = T * kinds.length; C.height = T;
+      const g = C.getContext('2d');
+      const RED = '#d42b26', BLUE = '#1d5fb0', WHITE = '#ffffff', YEL = '#f2c230';
+      const circle = (cx, fill, ring) => { g.fillStyle = ring || fill; g.beginPath(); g.arc(cx, 64, 62, 0, 7); g.fill(); if (ring) { g.fillStyle = fill; g.beginPath(); g.arc(cx, 64, 50, 0, 7); g.fill(); } };
+      const arrow = (cx, ang) => { g.save(); g.translate(cx, 64); g.rotate(ang); g.fillStyle = WHITE; g.fillRect(-7, -10, 14, 40); g.beginPath(); g.moveTo(-22, -8); g.lineTo(0, -36); g.lineTo(22, -8); g.fill(); g.restore(); };
+      kinds.forEach((k, i) => {
+        const cx = i * T + 64;
+        g.save(); g.beginPath(); g.rect(i * T, 0, T, T); g.clip();
+        if (k.includes('maximum-speed-limit')) { circle(cx, WHITE, RED); g.fillStyle = BLUE; g.font = '700 50px "Barlow Semi Condensed", sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(k.match(/(\d+)/)[1], cx, 67); }
+        else if (k.includes('no-parking')) { circle(cx, BLUE, RED); g.strokeStyle = RED; g.lineWidth = 12; g.beginPath(); g.moveTo(cx - 34, 30); g.lineTo(cx + 34, 98); g.stroke(); }
+        else if (k.includes('no-entry')) { circle(cx, RED); g.fillStyle = WHITE; g.fillRect(cx - 42, 54, 84, 20); }
+        else if (k.includes('stop')) { g.fillStyle = RED; g.beginPath(); g.moveTo(cx - 62, 8); g.lineTo(cx + 62, 8); g.lineTo(cx, 120); g.fill(); g.fillStyle = WHITE; g.font = '700 30px "BIZ UDPGothic", sans-serif'; g.textAlign = 'center'; g.fillText('止まれ', cx, 52); }
+        else if (k.includes('go-straight-or-turn-right')) { circle(cx, BLUE); arrow(cx - 8, 0); arrow(cx + 14, Math.PI / 2); }
+        else if (k.includes('go-straight-or-turn-left')) { circle(cx, BLUE); arrow(cx + 8, 0); arrow(cx - 14, -Math.PI / 2); }
+        else if (k.includes('go-straight') || k.includes('one-way')) { circle(cx, BLUE); arrow(cx, 0); }
+        else if (k.includes('turn-left') ) { circle(cx, BLUE); arrow(cx, -Math.PI / 2); }
+        else if (k.includes('pedestrians') || k.includes('shared-path')) { circle(cx, BLUE); g.fillStyle = WHITE; g.beginPath(); g.arc(cx - 14, 34, 9, 0, 7); g.fill(); g.fillRect(cx - 20, 46, 12, 40); g.beginPath(); g.arc(cx + 18, 80, 14, 0, 7); g.fill(); }
+        else if (k.startsWith('warning')) { g.fillStyle = YEL; g.beginPath(); g.moveTo(cx, 2); g.lineTo(cx + 62, 64); g.lineTo(cx, 126); g.lineTo(cx - 62, 64); g.fill(); g.strokeStyle = '#111'; g.lineWidth = 5; g.stroke(); }
+        else { circle(cx, WHITE, RED); }
+        g.restore();
+      });
+      const tex = new THREE.CanvasTexture(C); tex.colorSpace = THREE.SRGBColorSpace;
+      const P = [], UV = [], N = [];
+      const pole = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.04, 0.04, 2.7, 6, 1, true).translate(0, 1.35, 0), metal, this.mlySigns.length);
+      this.mlySigns.forEach(([x, z, ang, k], i) => {
+        const gy = this.terrainHeight(x, z);
+        M.makeTranslation(x, gy, z); pole.setMatrixAt(i, M);
+        // 板は ang の向きから来る車の方を向く
+        const fx = Math.cos(ang), fz = Math.sin(ang), rx = -fz, rz = fx;
+        const ki = kinds.indexOf(k), cy = gy + 2.4, R = 0.32;
+        const u0 = ki * T / C.width, u1 = (ki + 1) * T / C.width;
+        const cxp = x - fx * 0.05, czp = z - fz * 0.05;
+        const A = [cxp - rx * R, cy - R, czp - rz * R], B = [cxp + rx * R, cy - R, czp + rz * R], Ct = [cxp + rx * R, cy + R, czp + rz * R], D = [cxp - rx * R, cy + R, czp - rz * R];
+        for (const [v3, uv] of [[A, [u1, 0]], [B, [u0, 0]], [Ct, [u0, 1]], [A, [u1, 0]], [Ct, [u0, 1]], [D, [u1, 1]]]) { P.push(...v3); UV.push(...uv); N.push(-fx, 0, -fz); }
+      });
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+      scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ map: tex, alphaTest: 0.5, side: THREE.DoubleSide, roughness: 0.5, emissive: 0xffffff, emissiveMap: tex, emissiveIntensity: 0.15 })), pole);
+    }
+    // マンホール(直径 60cm の円)と雨水ます(40cm 角)
+    const P2 = [], C2 = [];
+    const dark = new THREE.Color(0x3a3c3e), grate = new THREE.Color(0x2c2e30);
+    for (let i = 0; i < this.manholes.length; i += 3) {
+      const x = this.manholes[i], z = this.manholes[i + 1], kind = this.manholes[i + 2];
+      const y = this.height(x, z) + 0.025, col = kind ? grate : dark;
+      const sides = kind ? 4 : 14, R = kind ? 0.28 : 0.3;
+      for (let k = 0; k < sides; k++) {
+        const a0 = (k / sides) * Math.PI * 2 + (kind ? Math.PI / 4 : 0), a1 = ((k + 1) / sides) * Math.PI * 2 + (kind ? Math.PI / 4 : 0);
+        P2.push(x, y, z, x + Math.cos(a1) * R, y, z + Math.sin(a1) * R, x + Math.cos(a0) * R, y, z + Math.sin(a0) * R);
+        for (let q = 0; q < 3; q++) C2.push(col.r, col.g, col.b);
+      }
+    }
+    if (P2.length) {
+      const g2 = new THREE.BufferGeometry();
+      g2.setAttribute('position', new THREE.Float32BufferAttribute(P2, 3));
+      g2.setAttribute('color', new THREE.Float32BufferAttribute(C2, 3));
+      g2.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(P2.length).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+      const m2 = new THREE.Mesh(g2, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.4, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
+      m2.receiveShadow = true;
+      scene.add(m2);
+    }
+  }
+
   // ---------- 縁石(高さ 15cm、幅 18cm) ----------
   _buildCurbs(scene) {
     const P = [], N = [];
@@ -1266,6 +1358,13 @@ uniform int usePhoto;`)
     }
     g.restore();
   }
+}
+
+// 路上写真の壁の色:写真は日なた・日陰・露出で明るさがばらつくので、色合いは写真から、明るさは範囲に収める
+function photoWall(c) {
+  const col = new THREE.Color().setRGB(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, THREE.SRGBColorSpace);
+  const hsl = {}; col.getHSL(hsl);
+  return new THREE.Color().setHSL(hsl.h, Math.min(0.35, hsl.s * 0.9), Math.min(0.9, Math.max(0.3, hsl.l * 1.12)));
 }
 
 // 空中写真の屋根の色を、地上から見た色に近づける
